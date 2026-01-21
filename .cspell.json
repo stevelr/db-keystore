@@ -1,0 +1,20 @@
+{
+	"version": "0.2",
+	"language": "en",
+	"dictionaries": ["rust"],
+	"ignorePaths": ["target/", "Cargo.lock"],
+	"ignoreRegExpList": [],
+	"words": [
+		"Schoettler",
+		"creds",
+		"hexkey",
+		"macbook",
+		"nocapture",
+		"subsec",
+		"syscall",
+		"tmpfs",
+		"turso",
+		"uidx",
+		"uring"
+	]
+}
