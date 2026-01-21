@@ -11,6 +11,13 @@ keywords = ["keyring", "credential", "sqlite", "turso", "secrets-manager"]
 categories = ["database", "api-bindings"]
 readme = "README.md"
 
+[lib]
+
+[[bin]]
+name = "dump-db-keystore"
+path = "bin/dump-db-keystore.rs"
+
+
 [dependencies]
 futures = "=0.3.31"
 keyring-core = "=0.7.2"

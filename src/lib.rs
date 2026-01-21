@@ -105,8 +105,8 @@ pub struct DbKeyStoreConfig {
     pub index_always: bool,
 }
 
-/// Default path is $XDG_STATE_HOME/keystore.db or $HOME/.local/state/keystore.db
-fn default_path() -> Result<PathBuf> {
+/// Default path for keystore: $XDG_STATE_HOME/keystore.db or $HOME/.local/state/keystore.db
+pub fn default_path() -> Result<PathBuf> {
     Ok(match std::env::var("XDG_STATE_HOME") {
         Ok(d) => PathBuf::from(d),
         _ => match std::env::var("HOME") {
@@ -133,6 +133,8 @@ struct DbKeyStoreInner {
     db: Database,
     id: String,
     allow_ambiguity: bool,
+    encrypted: bool,
+    path: PathBuf,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -151,11 +153,11 @@ struct DbKeyCredential {
 impl DbKeyStore {
     pub fn new(config: &DbKeyStoreConfig) -> Result<DbKeyStore> {
         let path = if config.path.as_os_str().is_empty() {
-            &default_path()?
+            default_path()?
         } else {
-            &config.path
+            config.path.clone()
         };
-        ensure_parent_dir(path)?;
+        ensure_parent_dir(&path)?;
         let path_str = path.to_str().ok_or_else(|| {
             Error::Invalid("path".into(), format!("invalid path {}", path.display()))
         })?;
@@ -163,19 +165,25 @@ impl DbKeyStore {
         let conn = retry_turso_locking(|| db.connect())?;
         configure_connection(&conn)?;
         init_schema(&conn, config.allow_ambiguity, config.index_always)?;
+        let encrypted = config
+            .encryption_opts
+            .as_ref()
+            .is_some_and(|o| !o.cipher.is_empty());
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         let id = format!(
-            "DbKeyStore {} @ {}",
-            config.path.display(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64()
+            "DbKeyStore v{} path:{path_str} enc:{encrypted} @ {start_time}",
+            env!("CARGO_PKG_VERSION"),
         );
         Ok(DbKeyStore {
             inner: Arc::new(DbKeyStoreInner {
                 db,
                 id,
                 allow_ambiguity: config.allow_ambiguity,
+                encrypted,
+                path,
             }),
         })
     }
@@ -226,6 +234,16 @@ impl DbKeyStore {
             index_always: index_always.unwrap_or(false),
         };
         DbKeyStore::new(&config)
+    }
+
+    /// Returns the database file path
+    pub fn path(&self) -> &Path {
+        self.inner.path.as_path()
+    }
+
+    /// Returns true if the db file is encrypted
+    pub fn is_encrypted(&self) -> bool {
+        self.inner.encrypted
     }
 }
 
@@ -996,7 +1014,7 @@ mod tests {
         entry.update_attributes(&update).expect("update_attributes");
         let attrs = entry.get_attributes().expect("get_attributes");
         assert_eq!(attrs.get("comment"), Some(&"note".to_string()));
-        assert!(attrs.get("uuid").is_some());
+        assert!(attrs.contains_key("uuid"));
 
         let mut spec = HashMap::new();
         spec.insert("service", "service");

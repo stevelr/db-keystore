@@ -5,11 +5,11 @@
 	"ignorePaths": ["target/", "Cargo.lock"],
 	"ignoreRegExpList": [],
 	"words": [
-		"Schoettler",
 		"creds",
 		"hexkey",
 		"macbook",
 		"nocapture",
+		"Schoettler",
 		"subsec",
 		"syscall",
 		"tmpfs",
