@@ -1,13 +1,13 @@
-//! Dump all keys in database to stdout.
+//! Dump all keys in sqlite keystore to stdout.
 //!
 //! Syntax: dump [PATH] key=val ...
 //!    PATH is path to existing database, defaults to ~/.local/state/keystore.db
 //!    Additional args are modifiers. For encryption, use keys 'cipher' and 'hexkey'
 //!   
 //! SECURITY WARNING:
-//!    This is a debugging tool that prints all secrets in the database. The existence
+//!    This is a debugging tool that prints all secrets in the keystore. The existence
 //!    of this program doesn't make the database less secure, but how you use use it might.
-//!    For example, encryption keys passed on the command line may be saved in shell history.
+//!    For example, encryption keys passed on the command line may be logged in shell history.
 //!
 use db_keystore::DbKeyStore;
 use keyring_core::{Entry, api::CredentialStoreApi};
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for arg in args[1..].iter() {
         if let Some((key, val)) = arg.split_once('=') {
             if key == "path" {
-                path = Some(key);
+                path = Some(val);
             }
             modifiers.insert(key, val);
         } else if path.is_none() {

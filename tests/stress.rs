@@ -7,6 +7,7 @@ use keyring_core::api::CredentialStoreApi;
 // Stress test environment variables:
 //  - STRESS_DB_DIR: optional directory for the SQLite file (prefers tmpfs).
 //  - STRESS_DB: internal child-only database path.
+//  - STRESS_DB_TEMP_DIR: parent temp dir for child cleanup (set by parent test).
 //  - STRESS_ID: child identifier string used in generated secrets.
 //  - STRESS_CHILD: set in child processes to select child-only tests.
 //  - STRESS_MODE: selects which child test to run (e.g. "random_rw").
@@ -19,17 +20,14 @@ use keyring_core::api::CredentialStoreApi;
 // 3. fall back to tempfile::tempdir()
 //    (note: on macos, tempdir is usually disk-backed)
 
-const DEFAULT_STRESS_ENTRIES: usize = 250;
-const DEFAULT_STRESS_SECONDS: u64 = 5;
+const DEFAULT_STRESS_ENTRIES: usize = 250; // rows in stress tests
+const DEFAULT_STRESS_SECONDS: u64 = 10; // duration of stress tests
 
 #[test]
-#[ignore]
+#[ignore] // Run with: cargo test -- --ignored
 fn stress_two_processes() {
-    if std::env::var("STRESS_CHILD").is_ok() {
-        return;
-    }
     let tempdir = create_temp_db_dir();
-    let db_path = tempdir.path().join("store.db");
+    let db_path = tempdir.path().join("keystore.db");
     let db_path = db_path.to_str().expect("db path").to_string();
     println!("stress_two_processes db_path={db_path}");
     let exe = std::env::current_exe().expect("current_exe");
@@ -40,6 +38,10 @@ fn stress_two_processes() {
         .arg("--nocapture")
         .env("STRESS_CHILD", "1")
         .env("STRESS_DB", &db_path)
+        .env(
+            "STRESS_DB_TEMP_DIR",
+            tempdir.path().to_str().expect("tempdir path"),
+        )
         .env("STRESS_ID", "1")
         .spawn()
         .expect("spawn child1");
@@ -49,6 +51,10 @@ fn stress_two_processes() {
         .arg("--nocapture")
         .env("STRESS_CHILD", "1")
         .env("STRESS_DB", &db_path)
+        .env(
+            "STRESS_DB_TEMP_DIR",
+            tempdir.path().to_str().expect("tempdir path"),
+        )
         .env("STRESS_ID", "2")
         .spawn()
         .expect("spawn child2");
@@ -68,9 +74,15 @@ fn stress_child() {
         return;
     }
     let db_path = std::env::var("STRESS_DB").expect("STRESS_DB");
+    let db_path = std::path::PathBuf::from(db_path);
+    let _cleanup = TempDbCleanup::from_env(&db_path);
     let id = std::env::var("STRESS_ID").unwrap_or_else(|_| "0".to_string());
+    let seconds: u64 = std::env::var("STRESS_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_STRESS_SECONDS);
     let config = DbKeyStoreConfig {
-        path: db_path.into(),
+        path: db_path,
         ..Default::default()
     };
     let store = retry_locking(|| DbKeyStore::new(&config)).expect("store");
@@ -78,21 +90,22 @@ fn stress_child() {
         .build("stress-service", "stress-user", None)
         .expect("build entry");
 
-    for i in 0..200 {
-        let secret = format!("secret-{id}-{i}");
+    let start = Instant::now();
+    let deadline = Duration::from_secs(seconds);
+    let mut counter = 0u64;
+    while start.elapsed() < deadline {
+        let secret = format!("secret-{id}-{counter}");
+        counter = counter.wrapping_add(1);
         retry_locking(|| entry.set_secret(secret.as_bytes())).expect("set_secret");
         let _ = retry_locking(|| entry.get_secret()).expect("get_secret");
     }
 }
 
 #[test]
-#[ignore]
+#[ignore] // Run with: cargo test -- --ignored
 fn stress_random_rw_two_processes() {
-    if std::env::var("STRESS_CHILD").is_ok() {
-        return;
-    }
     let tempdir = create_temp_db_dir();
-    let db_path = tempdir.path().join("store.db");
+    let db_path = tempdir.path().join("keystore.db");
     let db_path = db_path.to_str().expect("db path").to_string();
     let exe = std::env::current_exe().expect("current_exe");
     println!(
@@ -107,6 +120,10 @@ fn stress_random_rw_two_processes() {
         .env("STRESS_CHILD", "1")
         .env("STRESS_MODE", "random_rw")
         .env("STRESS_DB", &db_path)
+        .env(
+            "STRESS_DB_TEMP_DIR",
+            tempdir.path().to_str().expect("tempdir path"),
+        )
         .env("STRESS_ID", "1")
         .env("STRESS_ENTRIES", DEFAULT_STRESS_ENTRIES.to_string())
         .env("STRESS_SECONDS", DEFAULT_STRESS_SECONDS.to_string())
@@ -119,6 +136,10 @@ fn stress_random_rw_two_processes() {
         .env("STRESS_CHILD", "1")
         .env("STRESS_MODE", "random_rw")
         .env("STRESS_DB", &db_path)
+        .env(
+            "STRESS_DB_TEMP_DIR",
+            tempdir.path().to_str().expect("tempdir path"),
+        )
         .env("STRESS_ID", "2")
         .env("STRESS_ENTRIES", DEFAULT_STRESS_ENTRIES.to_string())
         .env("STRESS_SECONDS", DEFAULT_STRESS_SECONDS.to_string())
@@ -140,6 +161,8 @@ fn stress_random_rw_child() {
         return;
     }
     let db_path = std::env::var("STRESS_DB").expect("STRESS_DB");
+    let db_path = std::path::PathBuf::from(db_path);
+    let _cleanup = TempDbCleanup::from_env(&db_path);
     let id = std::env::var("STRESS_ID").unwrap_or_else(|_| "0".to_string());
     let entries: usize = std::env::var("STRESS_ENTRIES")
         .ok()
@@ -150,7 +173,7 @@ fn stress_random_rw_child() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_STRESS_SECONDS);
     let config = DbKeyStoreConfig {
-        path: db_path.into(),
+        path: db_path,
         ..Default::default()
     };
     let store = retry_locking(|| DbKeyStore::new(&config)).expect("store");
@@ -208,7 +231,6 @@ fn file_size_by_entry_count() {
 }
 
 #[test]
-#[ignore]
 fn perf_index_always_lookup() {
     if std::env::var("PERF_INDEX").is_err() {
         return;
@@ -235,7 +257,7 @@ fn perf_index_always_lookup() {
                     .expect("set_secret");
             }
 
-            let lookups = std::cmp::max(100, std::cmp::min(5000, count * 10));
+            let lookups = std::cmp::max(100, std::cmp::min(1000, count * 10));
             let start = Instant::now();
             for i in 0..lookups {
                 let idx = i % count;
@@ -304,6 +326,37 @@ fn create_temp_db_dir() -> tempfile::TempDir {
             .expect("tempdir");
     }
     tempfile::tempdir().expect("tempdir")
+}
+
+struct TempDbCleanup {
+    db_path: std::path::PathBuf,
+}
+
+impl TempDbCleanup {
+    fn from_env(db_path: &std::path::Path) -> Option<Self> {
+        let temp_dir = std::env::var("STRESS_DB_TEMP_DIR").ok()?;
+        let temp_dir = std::path::PathBuf::from(temp_dir);
+        if db_path.starts_with(&temp_dir) {
+            Some(Self {
+                db_path: db_path.to_path_buf(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for TempDbCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.db_path);
+        if let Some(base) = self.db_path.file_name().and_then(|name| name.to_str()) {
+            let wal = self.db_path.with_file_name(format!("{base}-wal"));
+            let shm = self.db_path.with_file_name(format!("{base}-shm"));
+            let _ = std::fs::remove_file(wal);
+            let _ = std::fs::remove_file(shm);
+        }
+        // Note: temp_dir cleanup is handled by the parent process's TempDir
+    }
 }
 
 fn file_set_size(path: &std::path::Path) -> u64 {
