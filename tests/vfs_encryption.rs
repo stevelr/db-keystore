@@ -24,7 +24,7 @@ fn encryption_round_trip_requires_key() {
         let entry = store
             .build("enc-service", "enc-user", None)
             .expect("build entry");
-        entry.set_password("secret").expect("set_password");
+        entry.set_password("dromomeryx").expect("set_password");
     }
 
     {
@@ -38,7 +38,7 @@ fn encryption_round_trip_requires_key() {
             .build("enc-service", "enc-user", None)
             .expect("build entry");
         let value = entry.get_password().expect("get_password");
-        assert_eq!(value, "secret");
+        assert_eq!(value, "dromomeryx");
     }
 
     let config = DbKeyStoreConfig {
@@ -62,9 +62,9 @@ fn vfs_memory_is_accepted() {
     let entry = store
         .build("vfs-service", "vfs-user", None)
         .expect("build entry");
-    entry.set_password("hello").expect("set_password");
+    entry.set_password("dromomeryx").expect("set_password");
     let value = entry.get_password().expect("get_password");
-    assert_eq!(value, "hello");
+    assert_eq!(value, "dromomeryx");
 }
 
 #[cfg(target_os = "linux")]
@@ -81,7 +81,7 @@ fn vfs_io_uring_is_accepted() {
     let entry = store
         .build("vfs-service", "vfs-user", None)
         .expect("build entry");
-    entry.set_password("hello").expect("set_password");
+    entry.set_password("dromomeryx").expect("set_password");
     let value = entry.get_password().expect("get_password");
-    assert_eq!(value, "hello");
+    assert_eq!(value, "dromomeryx");
 }

@@ -41,7 +41,7 @@
 
 // SAFETY - Security and safety notes:
 //  - SQL injection: all user data is bound as parameters; SQL is static.
-//  - Secret handling: secrets are validated with UTF-8 and length checks.
+//  - Secret handling: secrets are validated with length checks.
 //    Optional on-disk encryption implemented in database.
 //  - Concurrency: set_secret uses a transaction for read/modify/write; single statements
 //    are atomic in SQLite.
@@ -69,10 +69,11 @@ use turso::{Builder, Connection, Database, Value};
 use uuid::Uuid;
 
 // length limits to prevent accidental blow up of db:
-//  - service and name: 128 bytes
-//  - secret: 8KB bytes
-const MAX_NAME_LEN: usize = 128;
-const MAX_SECRET_LEN: usize = 8196;
+//  - service and name: 1024 bytes
+//  - secret: 65536 bytes
+const MAX_NAME_LEN: usize = 1024;
+const MAX_SECRET_LEN: usize = 65536;
+const SCHEMA_VERSION: u32 = 1;
 // sqlite timeout for connection busy
 const BUSY_TIMEOUT_MS: u32 = 5000;
 /// retry logic for open and connect, in case there's a file lock
@@ -110,7 +111,7 @@ pub fn default_path() -> Result<PathBuf> {
     Ok(match std::env::var("XDG_STATE_HOME") {
         Ok(d) => PathBuf::from(d),
         _ => match std::env::var("HOME") {
-            Ok(h) => PathBuf::from(h).join(".local").join(".state"),
+            Ok(h) => PathBuf::from(h).join(".local").join("state"),
             _ => {
                 return Err(Error::Invalid(
                     "path".to_string(),
@@ -346,7 +347,8 @@ impl CredentialStoreApi for DbKeyStore {
 impl CredentialApi for DbKeyCredential {
     fn set_secret(&self, secret: &[u8]) -> Result<()> {
         validate_service_user(&self.id.service, &self.id.user)?;
-        let secret = validate_secret(secret)?;
+        validate_secret(secret)?;
+        let make_secret_value = || Value::Blob(secret.to_vec());
         let conn = self.inner.connect()?;
         if self.uuid.is_none() && !self.inner.allow_ambiguity {
             return map_turso(block_on(async {
@@ -359,7 +361,7 @@ impl CredentialApi for DbKeyCredential {
                         self.id.service.as_str(),
                         self.id.user.as_str(),
                         uuid.as_str(),
-                        secret.as_str(),
+                        make_secret_value(),
                         comment,
                     ),
                 )
@@ -376,7 +378,7 @@ impl CredentialApi for DbKeyCredential {
                     let updated = conn
                         .execute(
                             "UPDATE credentials SET secret = ?1 WHERE uuid = ?2",
-                            (secret.as_str(), uuid.as_str()),
+                            (make_secret_value(), uuid.as_str()),
                         )
                         .await
                         .map_err(map_turso_err)?;
@@ -398,7 +400,7 @@ impl CredentialApi for DbKeyCredential {
                                     self.id.service.as_str(),
                                     self.id.user.as_str(),
                                     uuid.as_str(),
-                                    secret.as_str(),
+                                    make_secret_value(),
                                     comment,
                                 ),
                             )
@@ -409,7 +411,7 @@ impl CredentialApi for DbKeyCredential {
                         1 => {
                             conn.execute(
                                 "UPDATE credentials SET secret = ?1 WHERE uuid = ?2",
-                                (secret.as_str(), uuids[0].as_str()),
+                                (make_secret_value(), uuids[0].as_str()),
                             )
                             .await
                             .map_err(map_turso_err)?;
@@ -443,7 +445,7 @@ impl CredentialApi for DbKeyCredential {
             Some(uuid) => {
                 let secret = map_turso(block_on(fetch_secret_by_uuid(&conn, uuid)))?;
                 match secret {
-                    Some(secret) => Ok(secret.into_bytes()),
+                    Some(secret) => Ok(secret),
                     None => Err(Error::NoEntry),
                 }
             }
@@ -451,7 +453,7 @@ impl CredentialApi for DbKeyCredential {
                 let matches = map_turso(block_on(fetch_secrets_by_id(&conn, &self.id)))?;
                 match matches.len() {
                     0 => Err(Error::NoEntry),
-                    1 => Ok(matches[0].1.clone().into_bytes()),
+                    1 => Ok(matches[0].1.clone()),
                     _ => Err(Error::Ambiguous(ambiguous_entries(
                         Arc::clone(&self.inner),
                         &self.id,
@@ -646,9 +648,14 @@ impl CredentialApi for DbKeyCredential {
 
 fn init_schema(conn: &Connection, allow_ambiguity: bool, index_always: bool) -> Result<()> {
     map_turso(block_on(conn.execute(
-        "CREATE TABLE IF NOT EXISTS credentials (service TEXT NOT NULL, user TEXT NOT NULL, uuid TEXT NOT NULL, secret TEXT NOT NULL, comment TEXT)",
+        "CREATE TABLE IF NOT EXISTS credentials (service TEXT NOT NULL, user TEXT NOT NULL, uuid TEXT NOT NULL, secret BLOB NOT NULL, comment TEXT)",
         (),
     )))?;
+    map_turso(block_on(conn.execute(
+        "CREATE TABLE IF NOT EXISTS keystore_meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)",
+        (),
+    )))?;
+    ensure_schema_version(conn)?;
     if !allow_ambiguity {
         // unique index used to help ensure non-ambiguity of (service,user)
         map_turso(block_on(conn.execute(
@@ -666,6 +673,35 @@ fn init_schema(conn: &Connection, allow_ambiguity: bool, index_always: bool) -> 
             )))?;
     }
     Ok(())
+}
+
+fn ensure_schema_version(conn: &Connection) -> Result<()> {
+    map_turso(block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT value FROM keystore_meta WHERE key = 'schema_version'",
+                (),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let value = value_to_string(row.get_value(0)?, "schema_version")?;
+            let version = value.parse::<u32>().map_err(|_| {
+                turso::Error::ConversionFailure(format!("invalid schema_version value: {value}"))
+            })?;
+            if version != SCHEMA_VERSION {
+                return Err(turso::Error::ConversionFailure(format!(
+                    "unsupported schema version: {version}"
+                )));
+            }
+        } else {
+            conn.execute(
+                "INSERT INTO keystore_meta (key, value) VALUES ('schema_version', ?1)",
+                (SCHEMA_VERSION.to_string(),),
+            )
+            .await?;
+        }
+        Ok(())
+    }))
 }
 
 async fn query_all_credentials(
@@ -700,21 +736,21 @@ async fn fetch_uuids(conn: &Connection, id: &CredId) -> turso::Result<Vec<String
     Ok(uuids)
 }
 
-async fn fetch_secret_by_uuid(conn: &Connection, uuid: &str) -> turso::Result<Option<String>> {
+async fn fetch_secret_by_uuid(conn: &Connection, uuid: &str) -> turso::Result<Option<Vec<u8>>> {
     let mut rows = conn
         .query("SELECT secret FROM credentials WHERE uuid = ?1", (uuid,))
         .await?;
     let Some(row) = rows.next().await? else {
         return Ok(None);
     };
-    let secret = value_to_string(row.get_value(0)?, "secret")?;
+    let secret = value_to_bytes(row.get_value(0)?, "secret")?;
     Ok(Some(secret))
 }
 
 async fn fetch_secrets_by_id(
     conn: &Connection,
     id: &CredId,
-) -> turso::Result<Vec<(String, String)>> {
+) -> turso::Result<Vec<(String, Vec<u8>)>> {
     let mut rows = conn
         .query(
             "SELECT uuid, secret FROM credentials WHERE service = ?1 AND user = ?2",
@@ -724,7 +760,7 @@ async fn fetch_secrets_by_id(
     let mut results = Vec::new();
     while let Some(row) = rows.next().await? {
         let uuid = value_to_string(row.get_value(0)?, "uuid")?;
-        let secret = value_to_string(row.get_value(1)?, "secret")?;
+        let secret = value_to_bytes(row.get_value(1)?, "secret")?;
         results.push((uuid, secret));
     }
     Ok(results)
@@ -892,6 +928,16 @@ fn value_to_string(value: Value, field: &str) -> turso::Result<String> {
     }
 }
 
+fn value_to_bytes(value: Value, field: &str) -> turso::Result<Vec<u8>> {
+    match value {
+        Value::Blob(blob) => Ok(blob),
+        Value::Text(text) => Ok(text.into_bytes()),
+        other => Err(turso::Error::ConversionFailure(format!(
+            "unexpected value for {field}: {other:?}"
+        ))),
+    }
+}
+
 fn value_to_option_string(value: Value, field: &str) -> turso::Result<Option<String>> {
     match value {
         Value::Null => Ok(None),
@@ -938,14 +984,12 @@ fn validate_service_user(service: &str, user: &str) -> Result<()> {
     Ok(())
 }
 
-/// confirm secret is a valid utf8 string and within length bounds
-fn validate_secret(secret: &[u8]) -> Result<String> {
+/// confirm secret is within length bounds
+fn validate_secret(secret: &[u8]) -> Result<()> {
     if secret.len() > MAX_SECRET_LEN {
         return Err(Error::TooLong("secret".to_string(), MAX_SECRET_LEN as u32));
     }
-    let text = std::str::from_utf8(secret)
-        .map_err(|_| Error::Invalid("secret".to_string(), "secret is not utf8".to_string()))?;
-    Ok(text.to_string())
+    Ok(())
 }
 
 fn validate_search_spec(spec: &HashMap<&str, &str>) -> Result<()> {
@@ -986,29 +1030,50 @@ mod tests {
             .expect("failed to build entry")
     }
 
+    // test that non-existent parent dir is created on db open
+    #[test]
+    fn create_store_creates_parent_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("nested").join("deeply").join("keystore.db");
+        let parent = db_path.parent().expect("parent");
+        assert!(!parent.exists());
+
+        let config = DbKeyStoreConfig {
+            path: db_path.clone(),
+            ..Default::default()
+        };
+        let store = DbKeyStore::new(&config).expect("create store");
+        assert!(parent.is_dir());
+
+        let entry = build_entry(&store, "demo", "alice");
+        entry.set_password("dromomeryx").expect("set_password");
+    }
+
+    // test round-trip set and search
     #[test]
     fn set_password_then_search_finds_password() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db");
+        let path = dir.path().join("keystore.db");
         let store = new_store(&path);
-        let entry = build_entry(&store, "service", "user");
-        entry.set_password("hunter2").expect("set_password");
+        let entry = build_entry(&store, "demo", "alice");
+        entry.set_password("dromomeryx").expect("set_password");
 
         let mut spec = HashMap::new();
-        spec.insert("service", "service");
-        spec.insert("user", "user");
+        spec.insert("service", "demo");
+        spec.insert("user", "alice");
         let results = store.search(&spec).expect("search");
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].get_password().unwrap(), "hunter2");
+        assert_eq!(results[0].get_password().unwrap(), "dromomeryx");
     }
 
+    // test with comment search
     #[test]
     fn comment_attributes_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db");
+        let path = dir.path().join("keystore.db");
         let store = new_store(&path);
-        let entry = build_entry(&store, "service", "user");
-        entry.set_password("hunter2").expect("set_password");
+        let entry = build_entry(&store, "demo", "alice");
+        entry.set_password("dromomeryx").expect("set_password");
 
         let update = HashMap::from([("comment", "note")]);
         entry.update_attributes(&update).expect("update_attributes");
@@ -1017,109 +1082,174 @@ mod tests {
         assert!(attrs.contains_key("uuid"));
 
         let mut spec = HashMap::new();
-        spec.insert("service", "service");
-        spec.insert("user", "user");
+        spec.insert("service", "demo");
+        spec.insert("user", "alice");
         spec.insert("comment", "note");
         let results = store.search(&spec).expect("search");
         assert_eq!(results.len(), 1);
 
         let uuid = attrs.get("uuid").cloned().unwrap();
         let mut spec = HashMap::new();
-        spec.insert("service", "service");
-        spec.insert("user", "user");
+        spec.insert("service", "demo");
+        spec.insert("user", "alice");
         spec.insert("uuid", uuid.as_str());
         let results = store.search(&spec).expect("search");
         assert_eq!(results.len(), 1);
     }
 
     #[test]
-    fn stores_separate_service_user_pairs() {
+    fn comment_with_password_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db");
+        let path = dir.path().join("keystore.db");
         let store = new_store(&path);
+        let entry = build_entry(&store, "demo", "alice");
+        entry.set_password("dromomeryx").expect("set_password");
 
-        build_entry(&store, "service1", "user1")
-            .set_password("pw1")
-            .unwrap();
-        build_entry(&store, "service1", "user2")
-            .set_password("pw2")
-            .unwrap();
-        build_entry(&store, "service", "user3")
-            .set_password("pw3")
-            .unwrap();
+        // set a comment attribute
+        let update = HashMap::from([("comment", "note")]);
+        entry.update_attributes(&update).expect("update_attributes");
 
+        // then search by comment
         let mut spec = HashMap::new();
-        spec.insert("service", "service1");
-        spec.insert("user", "user1");
-        let results = store.search(&spec).unwrap();
+        spec.insert("service", "demo");
+        spec.insert("user", "alice");
+        spec.insert("comment", "note");
+        let results = store.search(&spec).expect("search");
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].get_password().unwrap(), "pw1");
 
-        spec.insert("user", "user2");
-        let results = store.search(&spec).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].get_password().unwrap(), "pw2");
-
-        spec.insert("service", "service");
-        spec.insert("user", "user3");
-        let results = store.search(&spec).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].get_password().unwrap(), "pw3");
+        let found = &results[0];
+        assert_eq!(found.get_password().unwrap(), "dromomeryx");
+        let attrs = found.get_attributes().expect("get_attributes");
+        assert_eq!(attrs.get("comment"), Some(&"note".to_string()));
+        assert!(attrs.contains_key("uuid"));
     }
 
+    // test that unique users in same service have unique keys
     #[test]
-    fn search_missing_file_returns_empty() {
+    fn stores_separate_service_user_pairs() -> Result<()> {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db");
+        let path = dir.path().join("keystore.db");
         let store = new_store(&path);
 
-        let mut spec = HashMap::new();
-        spec.insert("service", "service");
-        spec.insert("user", "user");
-        let results = store.search(&spec).unwrap();
-        assert!(results.is_empty());
+        build_entry(&store, "myapp", "user1").set_password("pw1")?;
+        build_entry(&store, "myapp", "user2").set_password("pw2")?;
+        build_entry(&store, "myapp", "user3").set_password("pw3")?;
+
+        let results = store.search(&HashMap::from([("service", "myapp"), ("user", "user1")]))?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get_password()?, "pw1");
+
+        let results = store.search(&HashMap::from([("service", "myapp"), ("user", "user2")]))?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get_password()?, "pw2");
+
+        let results = store.search(&HashMap::from([("service", "myapp"), ("user", "user3")]))?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get_password()?, "pw3");
+        Ok(())
     }
 
+    // search with regex
+    #[test]
+    fn search_regex() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keystore.db");
+        let store = new_store(&path);
+
+        build_entry(&store, "myapp", "user1").set_password("pw1")?;
+        build_entry(&store, "myapp", "user2").set_password("pw2")?;
+        build_entry(&store, "myapp", "user3").set_password("pw3")?;
+        build_entry(&store, "other-app", "user1").set_password("pw4")?;
+
+        // regex search: all apps, user1
+        let results = store.search(&HashMap::from([("service", ".*app"), ("user", "user1")]))?;
+        assert_eq!(results.len(), 2, "search *app, user1");
+
+        // regex search _or_
+        let results = store.search(&HashMap::from([
+            ("service", "myapp"),
+            ("user", "user1|user2"),
+        ]))?;
+        assert_eq!(results.len(), 2, "search regex OR");
+
+        Ok(())
+    }
+
+    // search with partial hashmap
+    #[test]
+    fn search_partial() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keystore.db");
+        let store = new_store(&path);
+
+        // empty db has no entries
+        let results = store.search(&HashMap::new())?;
+        assert_eq!(results.len(), 0, "empty db, no results");
+
+        build_entry(&store, "myapp", "user1").set_password("pw1")?;
+        build_entry(&store, "other-app", "user1").set_password("pw2")?;
+
+        // empty search terms match all
+        let results = store.search(&HashMap::new())?;
+        assert_eq!(results.len(), 2, "search, empty hashmap");
+
+        // app-only match
+        let results = store.search(&HashMap::from([("service", "myapp")]))?;
+        assert_eq!(results.len(), 1, "search myapp");
+
+        // user-only match
+        let results = store.search(&HashMap::from([("user", "user1")]))?;
+        assert_eq!(results.len(), 2, "search user1");
+        Ok(())
+    }
+
+    // replacement
     #[test]
     fn repeated_set_replaces_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db");
+        let path = dir.path().join("keystore.db");
         let store = new_store(&path);
-        let entry = build_entry(&store, "service", "user");
+        let entry = build_entry(&store, "demo", "alice");
         entry.set_password("first").unwrap();
         entry.set_secret(b"second").unwrap();
 
         let mut spec = HashMap::new();
-        spec.insert("service", "service");
-        spec.insert("user", "user");
+        spec.insert("service", "demo");
+        spec.insert("user", "alice");
         let results = store.search(&spec).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].get_password().unwrap(), "second");
+        assert_eq!(
+            results[0].get_password().unwrap(),
+            "second",
+            "second password overwrites first"
+        );
     }
 
+    // deletion is idempotent, and no error returned if no entry
     #[test]
     fn remove_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db");
+        let path = dir.path().join("keystore.db");
         let store = new_store(&path);
-        let entry = build_entry(&store, "service", "user");
-        entry.set_password("pw").unwrap();
+        let entry = build_entry(&store, "demo", "alice");
+        entry.set_password("dromomeryx").unwrap();
         entry.delete_credential().unwrap();
         entry.delete_credential().unwrap();
     }
 
+    // deletion actually deletes
     #[test]
     fn remove_clears_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db");
+        let path = dir.path().join("keystore.db");
         let store = new_store(&path);
         let entry = build_entry(&store, "service", "user");
-        entry.set_password("pw").unwrap();
+        entry.set_password("dromomeryx").unwrap();
         entry.delete_credential().unwrap();
 
         let mut spec = HashMap::new();
-        spec.insert("service", "service");
-        spec.insert("user", "user");
+        spec.insert("service", "demo");
+        spec.insert("user", "alice");
         let results = store.search(&spec).unwrap();
         assert!(results.is_empty());
     }

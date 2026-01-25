@@ -6,6 +6,7 @@
 	"ignoreRegExpList": [],
 	"words": [
 		"creds",
+		"dromomeryx",
 		"hexkey",
 		"macbook",
 		"nocapture",
@@ -15,6 +16,7 @@
 		"tmpfs",
 		"turso",
 		"uidx",
-		"uring"
+		"uring",
+		"wrongkey"
 	]
 }
