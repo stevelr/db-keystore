@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.1] - 2026-01-28
+
+### Added
+
+- Allow `build` modifiers `uuid` and `comment`, enabling explicit UUID creation and initial comment storage.
+- New tests for ambiguity handling, shared credentials, in-memory store round-trip, and comment modifiers.
+- Documentation for vfs options
+- Added impl Debug for DbKeyStore
+
+### Changed
+
+- Modifier/spec validation now uses `parse_attributes`, including boolean parsing.
+- Consolidated credential fetch queries to reduce duplication.
+- Updated docs to describe `index-always` and build modifiers.
+- Clarified that memory vfs ignores path and encryption keys.
+
+### Breaking
+
+- `new` returns `Result<Arc<DbKeyStore>>` instead of `Result<DbKeyStore>`
+- `delete_credential` now returns `NoEntry` when no matching credential exists (was idempotent and returned Ok).
+
 ## [0.3.0] - 2026-01-27
 
 ### Changed

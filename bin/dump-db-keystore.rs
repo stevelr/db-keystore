@@ -49,8 +49,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = DbKeyStore::new_with_modifiers(&modifiers)?;
     let entries: Vec<Entry> = store.search(&HashMap::new())?;
     println!(
-        "DbKeyStore @{}. Listing {} keys:",
-        store.path().display(),
+        "DbKeyStore {}. Listing {} keys:",
+        store.path(),
         entries.len()
     );
     for entry in entries.iter() {

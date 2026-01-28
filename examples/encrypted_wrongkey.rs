@@ -5,7 +5,7 @@
 
 use db_keystore::{DbKeyStore, DbKeyStoreConfig, EncryptionOpts};
 use keyring_core::api::CredentialStoreApi;
-use std::{collections::HashMap, panic, path::Path};
+use std::{collections::HashMap, panic, path::Path, sync::Arc};
 
 // See project README for list of supported ciphers and notes on creating
 // and securing keys.
@@ -19,7 +19,7 @@ fn create_db_config(
     path: &Path,
     cipher: &str,
     hexkey: &str,
-) -> Result<DbKeyStore, keyring_core::Error> {
+) -> Result<Arc<DbKeyStore>, keyring_core::Error> {
     let encryption_opts = EncryptionOpts {
         cipher: cipher.to_string(),
         hexkey: hexkey.to_string(),

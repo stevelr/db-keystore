@@ -1,6 +1,6 @@
 # db-keystore
 
-Platform-independent, SQLite-backed credential store for the `keyring-core` API, with optional encryption-at-rest.
+Platform-independent, SQLite-backed credential store for the `keyring-core` API, with optional encryption-at-rest. Built with [turso](https://crates.io/crates/turso).
 
 This crate implements [`keyring-core`](https://crates.io/crates/keyring-core)::[`CredentialStoreApi`](https://docs.rs/keyring-core/latest/keyring_core/api/trait.CredentialStoreApi.html) and [`CredentialApi`](https://docs.rs/keyring-core/latest/keyring_core/api/trait.CredentialApi.html).
 
@@ -23,42 +23,36 @@ Modifier keys (all optional):
 - **`allow-ambiguity`** (alias `allow_ambiguity`): `"true"` or `"false"`. Default `false`. Allows storage of more than one match for the pair (service,user). Individual pairs can be identified by the unique uuid or comment. When false, a `UNIQUE` index is created to enforce uniqueness.
 - **`encryption-cipher`** (alias `cipher`): Cipher name (requires `hexkey`). See below for list of supported ciphers.
 - **`encryption-hexkey`** (alias `hexkey`): Encryption key as 64 hex digits (256-bit key) or 32 hex digits (128-bit key) (requires `cipher`).
-- **`vfs`**: Optional VFS selection (`"memory"`, `"io_uring"`, or `"syscall"`).
+- **`index-always`** (alias `index_always`): `"true"` or `"false"`. Default `false`. Adds an index on `(service,user)` even when `allow-ambiguity` is true.
+- **`vfs`**: Optional VFS selection (`"memory"`, `"syscall"`, or `"io_uring"`).
+  - "memory": In-memory database. Data is entirely in RAM, and data is lost when process exits. When vfs=memory, `path` and encryption options are ignored.
+  - "syscall": Generic syscall backend. Uses standard POSIX system calls for file I/O. This is the most portable mode.
+  - "io_uring": Linux io_uring backend. Uses Linux's modern async I/O interface for better performance. Only available on Linux.
+
+Entry modifiers supported by `build`:
+
+- **`uuid`**: Explicit credential UUID (allows creating ambiguous entries when allowed).
+- **`comment`**: Initial comment value stored with the credential.
 
 ## Examples
 
-### Basic
-
-```rust
-use db_keystore::{DbKeyStore, DbKeyStoreConfig};
-use keyring_core::{Result, api::CredentialStoreApi};
-
-fn store_secrets() -> Result<()> {
-    let config = DbKeyStoreConfig::default();
-    let store = DbKeyStore::new(&config)?;
-
-    // store binary secret
-    let binary_entry = store.build("demo", "alice", None)?;
-    binary_entry.set_secret(b"\x00\xff\x80\x81")?;
-
-    // store string (utf8) secret
-    let entry = store.build("demo", "bob", None)?;
-    entry.set_password("dromomeryx")?;
-    Ok(())
-}
-```
-
-### Encrypted
+### Configure and open
 
 ```rust
 use db_keystore::{DbKeyStore, DbKeyStoreConfig, EncryptionOpts};
-use keyring_core::Result;
+use keyring_core::{Result, api::CredentialStoreApi};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
-// To open an encrypted keystore, set both `cipher` and `hexkey`.
-// `hexkey` must be the same key used to create the database.
-fn open_encrypted(hexkey: &str) -> Result<DbKeyStore> {
+/// Open in default location (~/.local/state/keystore.db)
+fn open_db() -> Result<Arc<DbKeyStore>> {
+    let config = DbKeyStoreConfig::default();
+    DbKeyStore::new(&config)
+}
+
+/// Open encrypted database in custom folder
+fn open_encrypted(dir: &Path, hexkey: &str) -> Result<Arc<DbKeyStore>> {
     let config = DbKeyStoreConfig {
-        path: "keystore.db".into(),
+        path: dir.join("keystore.db"),
         encryption_opts: Some(EncryptionOpts {
             cipher: "aegis256".to_string(),
             hexkey: hexkey.to_string(),
@@ -67,18 +61,63 @@ fn open_encrypted(hexkey: &str) -> Result<DbKeyStore> {
     };
     DbKeyStore::new(&config)
 }
+
+/// Open in-memory db
+fn open_in_memory() -> Result<Arc<DbKeyStore>> {
+    let config = DbKeyStoreConfig {
+        vfs: Some("memory".to_string()),
+        ..Default::default()
+    };
+    DbKeyStore::new(&config)
+}
 ```
 
-### Search (key lookup)
-
-Search expects a HashMap of regex filters. Supported keys: `service`, `user`, `uuid`, `comment`. If `comment` is provided, results must have a matching comment.
+### Save and lookup secrets
 
 ```rust
-use std::collections::HashMap;
+use db_keystore::{DbKeyStore, DbKeyStoreConfig, EncryptionOpts};
+use keyring_core::{Entry, Result, api::CredentialStoreApi};
+use std::{collections::HashMap, sync::Arc};
 
-fn lookup(service: &str, user: &str) -> Result<Vec<Entry>> {
+fn save_secrets(db: Arc<DbKeyStore>) -> Result<()> {
+    // use `set_password` to store secrets that are utf8 strings
+    // service and user must be non-empty
+    let entry = db.build("demo", "bob", None)?;
+    entry.set_password("dromomeryx")?;
+
+    // use `set_secret` to store any binary secret (up to 64KiB)
+    // service and user must be non-empty
+    let bin_entry = db.build("demo", "alice", None)?;
+    bin_entry.set_secret(b"\x00\xff\x80\x81")?;
+    Ok(())
+}
+
+
+/// Verify secret. Returns true if there is a matching password for the service+user
+fn verify_secret(db: Arc<DbKeyStore>, service: &str, user: &str, expected: &[u8]) -> Result<bool> {
     let spec = HashMap::from([("service", service), ("user", user)]);
-    store.search(&spec)
+    let results = db.search(&spec)?;
+    // check all entries in case db has allow_ambiguity
+    for entry in results.iter() {
+        if entry.get_secret()? == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Search using optional regex filters. Returns matches
+fn search(
+    db: Arc<DbKeyStore>, service_re: Option<&str>, user_re: Option<&str>,
+    uuid_re: Option<&str>, comment_re: Option<&str>,
+) -> Result<Vec<Entry>> {
+    let mut spec = HashMap::new();
+    /// `search` supports keys: `service`, `user`, `uuid`, `comment`.
+    if let Some(service) = service_re { spec.insert("service", service); }
+    if let Some(user) = user_re { spec.insert("user", user); }
+    if let Some(uuid) = uuid_re { spec.insert("uuid", uuid); }
+    if let Some(comment) = comment_re { spec.insert("comment", comment); }
+    db.search(&spec)
 }
 ```
 

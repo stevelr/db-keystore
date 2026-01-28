@@ -10,7 +10,7 @@ fn main() -> Result<()> {
     // initialize keystore in default location
     let config = DbKeyStoreConfig::default();
     let store = DbKeyStore::new(&config)?;
-    println!("using store at {}", store.path().display());
+    println!("using store at {}", store.path());
 
     // set password for user alice
     let entry = store.build(SERVICE, "alice", None)?;

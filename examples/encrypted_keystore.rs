@@ -18,7 +18,7 @@ fn create_db_config(
     path: &Path,
     cipher: &str,
     hexkey: &str,
-) -> Result<DbKeyStore, keyring_core::Error> {
+) -> Result<Arc<DbKeyStore>, keyring_core::Error> {
     let encryption_opts = EncryptionOpts {
         cipher: cipher.to_string(),
         hexkey: hexkey.to_string(),
