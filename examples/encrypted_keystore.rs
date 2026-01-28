@@ -2,7 +2,7 @@
 //!
 use db_keystore::{DbKeyStore, DbKeyStoreConfig, EncryptionOpts};
 use keyring_core::api::CredentialStoreApi;
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 // See the project README (https://github.com/stevelr/db-keystore) for list of supported ciphers,
 // and notes about key generation.
@@ -37,7 +37,7 @@ fn create_db_modifiers(
     path: &Path,
     cipher: &str,
     hexkey: &str,
-) -> Result<DbKeyStore, keyring_core::Error> {
+) -> Result<Arc<DbKeyStore>, keyring_core::Error> {
     let path = path.to_str().expect("path is utf8");
     let settings = HashMap::from([("path", path), ("cipher", cipher), ("hexkey", hexkey)]);
     DbKeyStore::new_with_modifiers(&settings)

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.0] - 2026-01-27
+
+### Changed
+
+- `new_with_modifiers` returns `Result<Arc<DbKeyStore>>` instead of `Result<DbKeyStore>`
+
+  This may or may not be a breaking change, depending on how it's used. Bumping minor version to follow strict semver.
+
 ## [0.2.2] - 2026-01-25
 
 ### Added

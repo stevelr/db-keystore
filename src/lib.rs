@@ -189,7 +189,7 @@ impl DbKeyStore {
         })
     }
 
-    pub fn new_with_modifiers(modifiers: &HashMap<&str, &str>) -> Result<DbKeyStore> {
+    pub fn new_with_modifiers(modifiers: &HashMap<&str, &str>) -> Result<Arc<DbKeyStore>> {
         let mut path: Option<PathBuf> = None;
         let mut cipher: Option<String> = None;
         let mut hexkey: Option<String> = None;
@@ -234,7 +234,7 @@ impl DbKeyStore {
             vfs,
             index_always: index_always.unwrap_or(false),
         };
-        DbKeyStore::new(&config)
+        Ok(Arc::new(DbKeyStore::new(&config)?))
     }
 
     /// Returns the database file path

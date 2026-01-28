@@ -134,11 +134,15 @@ When using this or any encrypted storage, keep in mind that the greatest risks f
 - Generating keys from user input without a strong KDF (Argon2/scrypt) weakens security.
 - Storing encryption keys on disk with the database (or leaked in logs or environment) diminishes the benefits of encryption.
 
+## Release Notes (0.3.0)
+
+- `new_with_modifiers` now returns `Result<Arc<DbKeyStore>>` instead of `Result<DbKeyStore>`.
+
 ## Release Notes (0.2.2)
 
 ### Crash on incorrect decryption key
 
-In turso v0.4.3 (used in db-keystore 0.2.x), attempting to open an encrypted database with the wrong key panics. The panic is fixed with turso [PR 4670](https://github.com/tursodatabase/turso/pull/4670), merged into the main branch on 2026-01-15. After this is released on crates.io, we'll release an updated db-keystore.
+In turso v0.4.3 (used in db-keystore 0.2.x and 0.3.0), attempting to open an encrypted database with the wrong key panics. The panic is fixed with turso [PR 4670](https://github.com/tursodatabase/turso/pull/4670), merged into the main branch on 2026-01-15. After this is released on crates.io, we'll release an updated db-keystore.
 
 A potential work-around is to catch the panic. [One of the examples](./examples/encrypted_wrongkey.rs) shows how to catch the panic.
 
