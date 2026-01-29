@@ -106,7 +106,7 @@ pub struct DbKeyStoreConfig {
     /// Set cipher and encryption key to enable encryption
     pub encryption_opts: Option<EncryptionOpts>,
 
-    /// Allow non-unique values for (service,user) (see keystore-core documentation)
+    /// Allow non-unique values for (service,user) (see keyring-core documentation)
     pub allow_ambiguity: bool,
 
     /// Database I/O strategy: "memory", "syscall", or "io_uring"
@@ -202,10 +202,11 @@ impl DbKeyStore {
             } else {
                 config.path.clone()
             };
-            ensure_parent_dir(&path)?;
+            // turso requires paths to be valid utf8
             let path_str = path.to_str().ok_or_else(|| {
-                Error::Invalid("path".into(), format!("invalid path {}", path.display()))
+                Error::Invalid("path".into(), "path must be valid UTF-8".to_string())
             })?;
+            ensure_parent_dir(&path)?;
             let db =
                 open_db_with_retry(path_str, config.encryption_opts.clone(), config.vfs.clone())?;
             let conn = retry_turso_locking(|| db.connect())?;
