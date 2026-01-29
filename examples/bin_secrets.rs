@@ -9,7 +9,7 @@ const SERVICE: &str = "bin_example";
 fn main() -> Result<()> {
     let config = DbKeyStoreConfig::default();
     let store = DbKeyStore::new(&config)?;
-    println!("using store at {}", store.path().display());
+    println!("using store at {}", store.path());
 
     // `set_password` can be used to set secrets that are valid utf8 strings
     let entry = store.build(SERVICE, "textUser", None)?;

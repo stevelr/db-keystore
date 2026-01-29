@@ -18,6 +18,11 @@
 //! - `encryption-hexkey` / `hexkey`: encryption key as hex (optional, requires cipher).
 //! - `allow-ambiguity` / `allow_ambiguity`: `"true"` or `"false"` (default `"false"`).
 //! - `vfs`: optional VFS backing selection (`"memory"`, `"io_uring"`, or `"syscall"`).
+//! - `index-always` / `index_always`: `"true"` or `"false"` (default `"false"`).
+//!
+//! Modifiers supported by `build`:
+//! - `uuid`: explicit credential UUID (allows creating ambiguous entries when allowed).
+//! - `comment`: initial comment value stored with the credential.
 //!
 //! Example:
 //! ```rust
@@ -68,6 +73,8 @@ use regex::Regex;
 use turso::{Builder, Connection, Database, Value};
 use uuid::Uuid;
 
+const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // length limits to prevent accidental blow up of db:
 //  - service and name: 1024 bytes
 //  - secret: 65536 bytes
@@ -93,16 +100,23 @@ pub struct EncryptionOpts {
 /// Configure turso database
 #[derive(Debug, Default, Clone)]
 pub struct DbKeyStoreConfig {
-    /// path to database. Defaults to $XDG_STATE_HOME/keystore.db or $HOME/.local/state/keystore.db
+    /// Path to database. Defaults to $XDG_STATE_HOME/keystore.db or $HOME/.local/state/keystore.db
     pub path: PathBuf,
-    /// set cipher and encryption key to enable encryption
+
+    /// Set cipher and encryption key to enable encryption
     pub encryption_opts: Option<EncryptionOpts>,
-    /// allow non-unique values for (service,user) (see keystore-core documentation)
+
+    /// Allow non-unique values for (service,user) (see keystore-core documentation)
     pub allow_ambiguity: bool,
-    /// database io options: "memory" (in-memory), "syscall", or "io_uring" (linux only)
+
+    /// Database I/O strategy: "memory", "syscall", or "io_uring"
+    ///  - "memory": In-memory database. Data is entirely in RAM, and data is lost when process exits. When vfs=memory, `path` and `encryption_opts` are ignored.
+    ///  - "syscall": Generic syscall backend. Uses standard POSIX system calls for file I/O. This is the most portable mode.
+    ///  - "io_uring": Linux io_uring backend. Uses Linux's modern async I/O interface for better performance. Only available on Linux.
     pub vfs: Option<String>,
-    /// add index on (service,user) even when allow_ambiguity is true
-    /// increases file size about 2x, increases performance for large keystores (>500 entries)
+
+    /// Add index on (service,user) even when allow_ambiguity is true.
+    /// Increases file size about 2x, improves performance for large keystores (>~500 entries)
     pub index_always: bool,
 }
 
@@ -124,7 +138,7 @@ pub fn default_path() -> Result<PathBuf> {
     .join("keystore.db"))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DbKeyStore {
     inner: Arc<DbKeyStoreInner>,
 }
@@ -135,7 +149,7 @@ struct DbKeyStoreInner {
     id: String,
     allow_ambiguity: bool,
     encrypted: bool,
-    path: PathBuf,
+    path: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -149,74 +163,113 @@ struct DbKeyCredential {
     inner: Arc<DbKeyStoreInner>,
     id: CredId,
     uuid: Option<String>,
+    comment: Option<String>,
 }
 
 impl DbKeyStore {
-    pub fn new(config: &DbKeyStoreConfig) -> Result<DbKeyStore> {
-        let path = if config.path.as_os_str().is_empty() {
-            default_path()?
-        } else {
-            config.path.clone()
-        };
-        ensure_parent_dir(&path)?;
-        let path_str = path.to_str().ok_or_else(|| {
-            Error::Invalid("path".into(), format!("invalid path {}", path.display()))
-        })?;
-        let db = open_db_with_retry(path_str, config.encryption_opts.clone(), config.vfs.clone())?;
-        let conn = retry_turso_locking(|| db.connect())?;
-        configure_connection(&conn)?;
-        init_schema(&conn, config.allow_ambiguity, config.index_always)?;
-        let encrypted = config
-            .encryption_opts
-            .as_ref()
-            .is_some_and(|o| !o.cipher.is_empty());
+    pub fn new(config: &DbKeyStoreConfig) -> Result<Arc<DbKeyStore>> {
         let start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        let id = format!(
-            "DbKeyStore v{} path:{path_str} enc:{encrypted} @ {start_time}",
-            env!("CARGO_PKG_VERSION"),
-        );
-        Ok(DbKeyStore {
-            inner: Arc::new(DbKeyStoreInner {
-                db,
-                id,
-                allow_ambiguity: config.allow_ambiguity,
-                encrypted,
-                path,
-            }),
-        })
+        let (store, conn) = if let Some(vfs) = &config.vfs
+            && vfs == "memory"
+        {
+            // in-memory database. ignore path and encryption options
+            let db = map_turso(block_on(async {
+                Builder::new_local(":memory:")
+                    .with_io("memory".into())
+                    .build()
+                    .await
+            }))?;
+            let id = format!("DbKeyStore v{CRATE_VERSION} in-memory @ {start_time}",);
+            let conn = map_turso(db.connect())?;
+            (
+                DbKeyStore {
+                    inner: Arc::new(DbKeyStoreInner {
+                        db,
+                        id,
+                        allow_ambiguity: config.allow_ambiguity,
+                        encrypted: false,
+                        path: ":memory:".to_string(),
+                    }),
+                },
+                conn,
+            )
+        } else {
+            let path = if config.path.as_os_str().is_empty() {
+                default_path()?
+            } else {
+                config.path.clone()
+            };
+            ensure_parent_dir(&path)?;
+            let path_str = path.to_str().ok_or_else(|| {
+                Error::Invalid("path".into(), format!("invalid path {}", path.display()))
+            })?;
+            let db =
+                open_db_with_retry(path_str, config.encryption_opts.clone(), config.vfs.clone())?;
+            let conn = retry_turso_locking(|| db.connect())?;
+            configure_connection(&conn)?;
+            let encrypted = config
+                .encryption_opts
+                .as_ref()
+                .is_some_and(|o| !o.cipher.is_empty());
+            let id = format!(
+                "DbKeyStore v{CRATE_VERSION} path:{path_str} enc:{encrypted} @ {start_time}",
+            );
+            (
+                DbKeyStore {
+                    inner: Arc::new(DbKeyStoreInner {
+                        db,
+                        id,
+                        allow_ambiguity: config.allow_ambiguity,
+                        encrypted,
+                        path: path_str.to_string(),
+                    }),
+                },
+                conn,
+            )
+        };
+        init_schema(&conn, config.allow_ambiguity, config.index_always)?;
+        Ok(Arc::new(store))
     }
 
     pub fn new_with_modifiers(modifiers: &HashMap<&str, &str>) -> Result<Arc<DbKeyStore>> {
-        let mut path: Option<PathBuf> = None;
-        let mut cipher: Option<String> = None;
-        let mut hexkey: Option<String> = None;
-        let mut allow_ambiguity: Option<bool> = None;
-        let mut vfs: Option<String> = None;
-        let mut index_always: Option<bool> = None;
-        for (key, value) in modifiers {
-            match *key {
-                "path" => path = Some(PathBuf::from(value)),
-                "encryption-cipher" | "cipher" => cipher = Some((*value).to_string()),
-                "encryption-hexkey" | "hexkey" => hexkey = Some((*value).to_string()),
-                "allow-ambiguity" | "allow_ambiguity" => {
-                    allow_ambiguity = Some(parse_bool_modifier(key, value)?);
-                }
-                "vfs" => vfs = Some((*value).to_string()),
-                "index-always" | "index_always" => {
-                    index_always = Some(parse_bool_modifier(key, value)?);
-                }
-                _ => {
-                    return Err(Error::Invalid(
-                        "modifiers".to_string(),
-                        format!("unsupported modifier: {key}"),
-                    ));
-                }
-            }
-        }
-        let path = path.unwrap_or_default();
+        let mods = parse_attributes(
+            &[
+                "path",
+                "encryption-cipher",
+                "cipher",
+                "encryption-hexkey",
+                "hexkey",
+                "*allow-ambiguity",
+                "*allow_ambiguity",
+                "vfs",
+                "*index-always",
+                "*index_always",
+            ],
+            Some(modifiers),
+        )?;
+        let path = mods.get("path").map(PathBuf::from).unwrap_or_default();
+        let cipher = mods
+            .get("encryption-cipher")
+            .or_else(|| mods.get("cipher"))
+            .cloned();
+        let hexkey = mods
+            .get("encryption-hexkey")
+            .or_else(|| mods.get("hexkey"))
+            .cloned();
+        let allow_ambiguity = mods
+            .get("allow-ambiguity")
+            .or_else(|| mods.get("allow_ambiguity"))
+            .map(|value| value == "true")
+            .unwrap_or(false);
+        let index_always = mods
+            .get("index-always")
+            .or_else(|| mods.get("index_always"))
+            .map(|value| value == "true")
+            .unwrap_or(false);
+        let vfs = mods.get("vfs").cloned();
         let encryption_opts = match (cipher, hexkey) {
             (None, None) => None,
             (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
@@ -230,21 +283,31 @@ impl DbKeyStore {
         let config = DbKeyStoreConfig {
             path,
             encryption_opts,
-            allow_ambiguity: allow_ambiguity.unwrap_or(false),
+            allow_ambiguity,
             vfs,
-            index_always: index_always.unwrap_or(false),
+            index_always,
         };
-        Ok(Arc::new(DbKeyStore::new(&config)?))
-    }
-
-    /// Returns the database file path
-    pub fn path(&self) -> &Path {
-        self.inner.path.as_path()
+        DbKeyStore::new(&config)
     }
 
     /// Returns true if the db file is encrypted
     pub fn is_encrypted(&self) -> bool {
         self.inner.encrypted
+    }
+
+    /// Returns path to database file
+    pub fn path(&self) -> String {
+        self.inner.path.clone()
+    }
+}
+
+impl std::fmt::Debug for DbKeyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbKeyStore")
+            .field("id", &self.id())
+            .field("allow_ambiguity", &self.inner.allow_ambiguity)
+            .field("vendor", &self.vendor())
+            .finish()
     }
 }
 
@@ -253,6 +316,30 @@ impl DbKeyStoreInner {
         let conn = map_turso(self.db.connect())?;
         configure_connection(&conn)?;
         Ok(conn)
+    }
+}
+
+impl DbKeyCredential {
+    async fn insert_credential(
+        &self,
+        conn: &Connection,
+        uuid: &str,
+        secret: Value,
+        comment: Value,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO credentials (service, user, uuid, secret, comment) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                self.id.service.as_str(),
+                self.id.user.as_str(),
+                uuid,
+                secret,
+                comment,
+            ),
+        )
+        .await
+        .map_err(map_turso_err)?;
+        Ok(())
     }
 }
 
@@ -265,6 +352,9 @@ impl CredentialStoreApi for DbKeyStore {
         self.inner.id.clone()
     }
 
+    /// Create a credential entry for service and user.
+    /// Service and user must be non-empty, and within the length limits. (<=1024 chars)
+    /// Supported modifiers: `uuid`, `comment`.
     fn build(
         &self,
         service: &str,
@@ -272,39 +362,33 @@ impl CredentialStoreApi for DbKeyStore {
         modifiers: Option<&HashMap<&str, &str>>,
     ) -> Result<Entry> {
         validate_service_user(service, user)?;
-        if let Some(mods) = modifiers
-            && !mods.is_empty()
-        {
-            return Err(Error::Invalid(
-                "modifiers".to_string(),
-                "modifiers are not supported".to_string(),
-            ));
-        }
+        let mods = parse_attributes(&["uuid", "comment"], modifiers)?;
         let credential = DbKeyCredential {
             inner: Arc::clone(&self.inner),
             id: CredId {
                 service: service.to_string(),
                 user: user.to_string(),
             },
-            uuid: None,
+            uuid: mods.get("uuid").cloned(),
+            comment: mods.get("comment").cloned(),
         };
         Ok(Entry::new_with_credential(Arc::new(credential)))
     }
 
     fn search(&self, spec: &HashMap<&str, &str>) -> Result<Vec<Entry>> {
-        validate_search_spec(spec)?;
-        let service_re = Regex::new(spec.get("service").unwrap_or(&""))
+        let spec = parse_attributes(&["service", "user", "uuid", "comment"], Some(spec))?;
+        let service_re = Regex::new(spec.get("service").map(String::as_str).unwrap_or(""))
             .map_err(|e| Error::Invalid("service regex".to_string(), e.to_string()))?;
-        let user_re = Regex::new(spec.get("user").unwrap_or(&""))
+        let user_re = Regex::new(spec.get("user").map(String::as_str).unwrap_or(""))
             .map_err(|e| Error::Invalid("user regex".to_string(), e.to_string()))?;
-        let comment_re = Regex::new(spec.get("comment").unwrap_or(&""))
+        let comment_re = Regex::new(spec.get("comment").map(String::as_str).unwrap_or(""))
             .map_err(|e| Error::Invalid("comment regex".to_string(), e.to_string()))?;
-        let uuid_re = Regex::new(spec.get("uuid").unwrap_or(&""))
+        let uuid_re = Regex::new(spec.get("uuid").map(String::as_str).unwrap_or(""))
             .map_err(|e| Error::Invalid("uuid regex".to_string(), e.to_string()))?;
         let conn = self.inner.connect()?;
         let rows = map_turso(block_on(query_all_credentials(&conn)))?;
         let mut entries = Vec::new();
-        let filter_comment = spec.get("comment").is_some();
+        let filter_comment = spec.contains_key("comment");
         for (id, uuid, comment) in rows {
             if !service_re.is_match(id.service.as_str()) {
                 continue;
@@ -325,6 +409,7 @@ impl CredentialStoreApi for DbKeyStore {
                 inner: Arc::clone(&self.inner),
                 id,
                 uuid: Some(uuid),
+                comment: None,
             };
             entries.push(Entry::new_with_credential(Arc::new(credential)));
         }
@@ -349,11 +434,14 @@ impl CredentialApi for DbKeyCredential {
         validate_service_user(&self.id.service, &self.id.user)?;
         validate_secret(secret)?;
         let make_secret_value = || Value::Blob(secret.to_vec());
+        let make_comment_value = || match self.comment.as_ref() {
+            Some(value) => Value::Text(value.to_string()),
+            None => Value::Null,
+        };
         let conn = self.inner.connect()?;
         if self.uuid.is_none() && !self.inner.allow_ambiguity {
             return map_turso(block_on(async {
                 let uuid = Uuid::new_v4().to_string();
-                let comment = Value::Null;
                 conn.execute(
                     "INSERT INTO credentials (service, user, uuid, secret, comment) VALUES (?1, ?2, ?3, ?4, ?5) \
                     ON CONFLICT(service, user) DO UPDATE SET secret = excluded.secret",
@@ -362,7 +450,7 @@ impl CredentialApi for DbKeyCredential {
                         self.id.user.as_str(),
                         uuid.as_str(),
                         make_secret_value(),
-                        comment,
+                        make_comment_value(),
                     ),
                 )
                 .await?;
@@ -382,9 +470,39 @@ impl CredentialApi for DbKeyCredential {
                         )
                         .await
                         .map_err(map_turso_err)?;
-                    if updated == 0 {
-                        Err(Error::NoEntry)
+                    if updated > 0 {
+                        Ok(())
                     } else {
+                        if !self.inner.allow_ambiguity {
+                            let uuids =
+                                fetch_uuids(&conn, &self.id).await.map_err(map_turso_err)?;
+                            match uuids.len() {
+                                0 => {}
+                                1 => {
+                                    if uuids[0] != *uuid {
+                                        return Err(Error::Invalid(
+                                            "uuid".to_string(),
+                                            "credential already exists for service/user"
+                                                .to_string(),
+                                        ));
+                                    }
+                                }
+                                _ => {
+                                    return Err(Error::Ambiguous(ambiguous_entries(
+                                        Arc::clone(&self.inner),
+                                        &self.id,
+                                        uuids,
+                                    )));
+                                }
+                            }
+                        }
+                        self.insert_credential(
+                            &conn,
+                            uuid.as_str(),
+                            make_secret_value(),
+                            make_comment_value(),
+                        )
+                        .await?;
                         Ok(())
                     }
                 }
@@ -393,19 +511,13 @@ impl CredentialApi for DbKeyCredential {
                     match uuids.len() {
                         0 => {
                             let uuid = Uuid::new_v4().to_string();
-                            let comment = Value::Null;
-                            conn.execute(
-                                "INSERT INTO credentials (service, user, uuid, secret, comment) VALUES (?1, ?2, ?3, ?4, ?5)",
-                                (
-                                    self.id.service.as_str(),
-                                    self.id.user.as_str(),
-                                    uuid.as_str(),
-                                    make_secret_value(),
-                                    comment,
-                                ),
+                            self.insert_credential(
+                                &conn,
+                                uuid.as_str(),
+                                make_secret_value(),
+                                make_comment_value(),
                             )
-                            .await
-                            .map_err(map_turso_err)?;
+                            .await?;
                             Ok(())
                         }
                         1 => {
@@ -443,14 +555,14 @@ impl CredentialApi for DbKeyCredential {
         let conn = self.inner.connect()?;
         match &self.uuid {
             Some(uuid) => {
-                let secret = map_turso(block_on(fetch_secret_by_uuid(&conn, uuid)))?;
-                match secret {
-                    Some(secret) => Ok(secret),
+                let credential = map_turso(block_on(fetch_credential_by_uuid(&conn, uuid)))?;
+                match credential {
+                    Some((secret, _comment)) => Ok(secret),
                     None => Err(Error::NoEntry),
                 }
             }
             None => {
-                let matches = map_turso(block_on(fetch_secrets_by_id(&conn, &self.id)))?;
+                let matches = map_turso(block_on(fetch_credentials_by_id(&conn, &self.id)))?;
                 match matches.len() {
                     0 => Err(Error::NoEntry),
                     1 => Ok(matches[0].1.clone()),
@@ -469,19 +581,19 @@ impl CredentialApi for DbKeyCredential {
         let conn = self.inner.connect()?;
         match &self.uuid {
             Some(uuid) => {
-                let comment = map_turso(block_on(fetch_comment_by_uuid(&conn, uuid)))?;
-                match comment {
-                    Some(comment) => Ok(attributes_for_uuid(uuid.as_str(), comment)),
+                let credential = map_turso(block_on(fetch_credential_by_uuid(&conn, uuid)))?;
+                match credential {
+                    Some((_secret, comment)) => Ok(attributes_for_uuid(uuid.as_str(), comment)),
                     None => Err(Error::NoEntry),
                 }
             }
             None => {
-                let matches = map_turso(block_on(fetch_comments_by_id(&conn, &self.id)))?;
+                let matches = map_turso(block_on(fetch_credentials_by_id(&conn, &self.id)))?;
                 match matches.len() {
                     0 => Err(Error::NoEntry),
                     1 => Ok(attributes_for_uuid(
                         matches[0].0.as_str(),
-                        matches[0].1.clone(),
+                        matches[0].2.clone(),
                     )),
                     _ => Err(Error::Ambiguous(ambiguous_entries(
                         Arc::clone(&self.inner),
@@ -593,7 +705,7 @@ impl CredentialApi for DbKeyCredential {
             None => {
                 let uuids = map_turso(block_on(fetch_uuids(&conn, &self.id)))?;
                 match uuids.len() {
-                    0 => Ok(()),
+                    0 => Err(Error::NoEntry),
                     1 => {
                         map_turso(block_on(conn.execute(
                             "DELETE FROM credentials WHERE uuid = ?1",
@@ -613,9 +725,6 @@ impl CredentialApi for DbKeyCredential {
 
     fn get_credential(&self) -> Result<Option<Arc<Credential>>> {
         validate_service_user(&self.id.service, &self.id.user)?;
-        if self.uuid.is_some() {
-            return Ok(None);
-        }
         let conn = self.inner.connect()?;
         let uuids = map_turso(block_on(fetch_uuids(&conn, &self.id)))?;
         match uuids.len() {
@@ -624,6 +733,7 @@ impl CredentialApi for DbKeyCredential {
                 inner: Arc::clone(&self.inner),
                 id: self.id.clone(),
                 uuid: Some(uuids[0].clone()),
+                comment: None,
             }))),
             _ => Err(Error::Ambiguous(ambiguous_entries(
                 Arc::clone(&self.inner),
@@ -736,24 +846,31 @@ async fn fetch_uuids(conn: &Connection, id: &CredId) -> turso::Result<Vec<String
     Ok(uuids)
 }
 
-async fn fetch_secret_by_uuid(conn: &Connection, uuid: &str) -> turso::Result<Option<Vec<u8>>> {
+async fn fetch_credential_by_uuid(
+    conn: &Connection,
+    uuid: &str,
+) -> turso::Result<Option<(Vec<u8>, Option<String>)>> {
     let mut rows = conn
-        .query("SELECT secret FROM credentials WHERE uuid = ?1", (uuid,))
+        .query(
+            "SELECT secret, comment FROM credentials WHERE uuid = ?1",
+            (uuid,),
+        )
         .await?;
     let Some(row) = rows.next().await? else {
         return Ok(None);
     };
     let secret = value_to_bytes(row.get_value(0)?, "secret")?;
-    Ok(Some(secret))
+    let comment = value_to_option_string(row.get_value(1)?, "comment")?;
+    Ok(Some((secret, comment)))
 }
 
-async fn fetch_secrets_by_id(
+async fn fetch_credentials_by_id(
     conn: &Connection,
     id: &CredId,
-) -> turso::Result<Vec<(String, Vec<u8>)>> {
+) -> turso::Result<Vec<(String, Vec<u8>, Option<String>)>> {
     let mut rows = conn
         .query(
-            "SELECT uuid, secret FROM credentials WHERE service = ?1 AND user = ?2",
+            "SELECT uuid, secret, comment FROM credentials WHERE service = ?1 AND user = ?2",
             (id.service.as_str(), id.user.as_str()),
         )
         .await?;
@@ -761,41 +878,8 @@ async fn fetch_secrets_by_id(
     while let Some(row) = rows.next().await? {
         let uuid = value_to_string(row.get_value(0)?, "uuid")?;
         let secret = value_to_bytes(row.get_value(1)?, "secret")?;
-        results.push((uuid, secret));
-    }
-    Ok(results)
-}
-
-async fn fetch_comment_by_uuid(
-    conn: &Connection,
-    uuid: &str,
-) -> turso::Result<Option<Option<String>>> {
-    let mut rows = conn
-        .query("SELECT comment FROM credentials WHERE uuid = ?1", (uuid,))
-        .await?;
-    if let Some(row) = rows.next().await? {
-        let comment = value_to_option_string(row.get_value(0)?, "comment")?;
-        Ok(Some(comment))
-    } else {
-        Ok(None)
-    }
-}
-
-async fn fetch_comments_by_id(
-    conn: &Connection,
-    id: &CredId,
-) -> turso::Result<Vec<(String, Option<String>)>> {
-    let mut rows = conn
-        .query(
-            "SELECT uuid, comment FROM credentials WHERE service = ?1 AND user = ?2",
-            (id.service.as_str(), id.user.as_str()),
-        )
-        .await?;
-    let mut results = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let uuid = value_to_string(row.get_value(0)?, "uuid")?;
-        let comment = value_to_option_string(row.get_value(1)?, "comment")?;
-        results.push((uuid, comment));
+        let comment = value_to_option_string(row.get_value(2)?, "comment")?;
+        results.push((uuid, secret, comment));
     }
     Ok(results)
 }
@@ -808,6 +892,7 @@ fn ambiguous_entries(inner: Arc<DbKeyStoreInner>, id: &CredId, uuids: Vec<String
                 inner: Arc::clone(&inner),
                 id: id.clone(),
                 uuid: Some(uuid),
+                comment: None,
             }))
         })
         .collect()
@@ -822,6 +907,9 @@ fn attributes_for_uuid(uuid: &str, comment: Option<String>) -> HashMap<String, S
     attrs
 }
 
+// Database configuration
+// - Enable Write-Ahead Logging for better concurrency (less blocking)
+// - Sets busy timeout - how long to wait when db is locked by another connection before returning error
 fn configure_connection(conn: &Connection) -> Result<()> {
     map_turso(block_on(async {
         let mut rows = conn.query("PRAGMA journal_mode=WAL", ()).await?;
@@ -906,17 +994,6 @@ fn is_turso_locking_error(err: &turso::Error) -> bool {
         || text.contains("sqlite_locked")
 }
 
-fn parse_bool_modifier(key: &str, value: &str) -> Result<bool> {
-    match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(Error::Invalid(
-            key.to_string(),
-            "must be `true` or `false`".to_string(),
-        )),
-    }
-}
-
 fn value_to_string(value: Value, field: &str) -> turso::Result<String> {
     match value {
         Value::Text(text) => Ok(text),
@@ -992,18 +1069,6 @@ fn validate_secret(secret: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn validate_search_spec(spec: &HashMap<&str, &str>) -> Result<()> {
-    for key in spec.keys() {
-        if *key != "service" && *key != "user" && *key != "uuid" && *key != "comment" {
-            return Err(Error::Invalid(
-                "spec".to_string(),
-                format!("unsupported key: {key}"),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn map_turso<T>(result: std::result::Result<T, turso::Error>) -> Result<T> {
     result.map_err(map_turso_err)
 }
@@ -1016,7 +1081,7 @@ fn map_turso_err(err: turso::Error) -> Error {
 mod tests {
     use super::*;
 
-    fn new_store(path: &Path) -> DbKeyStore {
+    fn new_store(path: &Path) -> Arc<DbKeyStore> {
         let config = DbKeyStoreConfig {
             path: path.to_path_buf(),
             ..Default::default()
@@ -1088,7 +1153,7 @@ mod tests {
         let results = store.search(&spec).expect("search");
         assert_eq!(results.len(), 1);
 
-        let uuid = attrs.get("uuid").cloned().unwrap();
+        let uuid = attrs.get("uuid").cloned().expect("get uuid");
         let mut spec = HashMap::new();
         spec.insert("service", "demo");
         spec.insert("user", "alice");
@@ -1118,10 +1183,46 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let found = &results[0];
-        assert_eq!(found.get_password().unwrap(), "dromomeryx");
+        assert_eq!(
+            found.get_password().expect("password with comment"),
+            "dromomeryx"
+        );
         let attrs = found.get_attributes().expect("get_attributes");
         assert_eq!(attrs.get("comment"), Some(&"note".to_string()));
         assert!(attrs.contains_key("uuid"));
+    }
+
+    #[test]
+    fn build_with_comment_modifier_sets_comment() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keystore.db");
+        let store = new_store(&path);
+        let entry = store.build(
+            "demo",
+            "alice",
+            Some(&HashMap::from([("comment", "initial")])),
+        )?;
+        entry.set_password("dromomeryx")?;
+
+        let attrs = entry.get_attributes()?;
+        assert_eq!(attrs.get("comment"), Some(&"initial".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn in_memory_store_round_trip() -> Result<()> {
+        let config = DbKeyStoreConfig {
+            vfs: Some("memory".to_string()),
+            ..Default::default()
+        };
+        let store = DbKeyStore::new(&config)?;
+        let entry = build_entry(&store, "demo", "alice");
+        entry.set_password("dromomeryx")?;
+
+        let results = store.search(&HashMap::from([("service", "demo"), ("user", "alice")]))?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get_password()?, "dromomeryx");
+        Ok(())
     }
 
     // test that unique users in same service have unique keys
@@ -1210,31 +1311,48 @@ mod tests {
         let path = dir.path().join("keystore.db");
         let store = new_store(&path);
         let entry = build_entry(&store, "demo", "alice");
-        entry.set_password("first").unwrap();
-        entry.set_secret(b"second").unwrap();
+        entry.set_password("first").expect("password set 1");
+        entry.set_secret(b"second").expect("password set 2");
 
         let mut spec = HashMap::new();
         spec.insert("service", "demo");
         spec.insert("user", "alice");
-        let results = store.search(&spec).unwrap();
+        let results = store.search(&spec).expect("search");
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].get_password().unwrap(),
+            results[0].get_password().expect("get first password"),
             "second",
             "second password overwrites first"
         );
     }
 
-    // deletion is idempotent, and no error returned if no entry
     #[test]
-    fn remove_is_idempotent() {
+    fn same_service_user_entries_share_credential() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keystore.db");
+        let store = new_store(&path);
+        let entry1 = build_entry(&store, "demo", "alice");
+        let entry2 = build_entry(&store, "demo", "alice");
+
+        entry1.set_password("first")?;
+        assert_eq!(entry2.get_password()?, "first");
+
+        entry2.set_password("second")?;
+        assert_eq!(entry1.get_password()?, "second");
+        Ok(())
+    }
+
+    // deletion returns NoEntry if there is no matching entry
+    #[test]
+    fn remove_returns_no_entry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("keystore.db");
         let store = new_store(&path);
         let entry = build_entry(&store, "demo", "alice");
-        entry.set_password("dromomeryx").unwrap();
-        entry.delete_credential().unwrap();
-        entry.delete_credential().unwrap();
+        entry.set_password("dromomeryx").expect("set password");
+        entry.delete_credential().expect("delete credential");
+        let err = entry.delete_credential().unwrap_err();
+        assert!(matches!(err, Error::NoEntry));
     }
 
     // deletion actually deletes
@@ -1244,13 +1362,108 @@ mod tests {
         let path = dir.path().join("keystore.db");
         let store = new_store(&path);
         let entry = build_entry(&store, "service", "user");
-        entry.set_password("dromomeryx").unwrap();
-        entry.delete_credential().unwrap();
+        entry.set_password("dromomeryx").expect("set password");
+        entry.delete_credential().expect("delete credential");
 
         let mut spec = HashMap::new();
         spec.insert("service", "demo");
         spec.insert("user", "alice");
-        let results = store.search(&spec).unwrap();
+        let results = store.search(&spec).expect("search");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn allow_ambiguity_allows_multiple_entries_per_user() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keystore.db");
+        let config = DbKeyStoreConfig {
+            path: path.clone(),
+            allow_ambiguity: true,
+            ..Default::default()
+        };
+        let store = DbKeyStore::new(&config)?;
+
+        let uuid1 = Uuid::new_v4().to_string();
+        let uuid2 = Uuid::new_v4().to_string();
+        let entry1 = store.build(
+            "demo",
+            "alice",
+            Some(&HashMap::from([
+                ("uuid", uuid1.as_str()),
+                ("comment", "one"),
+            ])),
+        )?;
+        let entry2 = store.build(
+            "demo",
+            "alice",
+            Some(&HashMap::from([
+                ("uuid", uuid2.as_str()),
+                ("comment", "two"),
+            ])),
+        )?;
+        entry1.set_password("first")?;
+        entry2.set_password("second")?;
+
+        let results = store.search(&HashMap::from([("service", "demo"), ("user", "alice")]))?;
+        assert_eq!(results.len(), 2);
+
+        let entry3 = build_entry(&store, "demo", "alice");
+        let err = entry3.get_password().unwrap_err();
+        assert!(matches!(err, Error::Ambiguous(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn disallow_ambiguity_rejects_duplicate_uuid_entries() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keystore.db");
+        let store = new_store(&path);
+
+        let uuid1 = Uuid::new_v4().to_string();
+        let uuid2 = Uuid::new_v4().to_string();
+        let entry1 = store.build(
+            "demo",
+            "alice",
+            Some(&HashMap::from([("uuid", uuid1.as_str())])),
+        )?;
+        let entry2 = store.build(
+            "demo",
+            "alice",
+            Some(&HashMap::from([("uuid", uuid2.as_str())])),
+        )?;
+
+        entry1.set_password("first")?;
+        let err = entry2.set_password("second").unwrap_err();
+        assert!(matches!(err, Error::Invalid(key, _) if key == "uuid"));
+        Ok(())
+    }
+
+    #[test]
+    fn impl_debug() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let path = dir.path().join("keystore1.db");
+        let store = new_store(&path);
+        eprintln!("basic: {store:?}");
+
+        let path = dir.path().join("keystore2.db");
+        let config = DbKeyStoreConfig {
+            path: path.to_path_buf(),
+            encryption_opts: Some(EncryptionOpts {
+                cipher: "aes256gcm".into(),
+                hexkey: "0000000011111111222222223333333344444444555555556666666677777777".into(),
+            }),
+            ..Default::default()
+        };
+        let store = DbKeyStore::new(&config)?;
+        eprintln!("with_enc: {store:?}");
+
+        let config = DbKeyStoreConfig {
+            vfs: Some("memory".to_string()),
+            ..Default::default()
+        };
+        let store = DbKeyStore::new(&config)?;
+        eprintln!("memory: {store:?}");
+        Ok(())
     }
 }
