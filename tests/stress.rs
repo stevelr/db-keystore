@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use db_keystore::{DbKeyStore, DbKeyStoreConfig};
 use keyring_core::api::CredentialStoreApi;
+use zeroize::Zeroizing;
 
 // Stress test environment variables:
 //  - STRESS_DB_DIR: optional directory for the SQLite file (prefers tmpfs).
@@ -85,7 +86,7 @@ fn stress_child() {
         path: db_path,
         ..Default::default()
     };
-    let store = retry_locking(|| DbKeyStore::new(&config)).expect("store");
+    let store = retry_locking(|| DbKeyStore::new(config.clone())).expect("store");
     let entry = store
         .build("stress-service", "stress-user", None)
         .expect("build entry");
@@ -94,10 +95,10 @@ fn stress_child() {
     let deadline = Duration::from_secs(seconds);
     let mut counter = 0u64;
     while start.elapsed() < deadline {
-        let secret = format!("secret-{id}-{counter}");
+        let secret = Zeroizing::new(format!("secret-{id}-{counter}"));
         counter = counter.wrapping_add(1);
         retry_locking(|| entry.set_secret(secret.as_bytes())).expect("set_secret");
-        let _ = retry_locking(|| entry.get_secret()).expect("get_secret");
+        let _secret = Zeroizing::new(retry_locking(|| entry.get_secret()).expect("get_secret"));
     }
 }
 
@@ -176,14 +177,15 @@ fn stress_random_rw_child() {
         path: db_path,
         ..Default::default()
     };
-    let store = retry_locking(|| DbKeyStore::new(&config)).expect("store");
+    let store = retry_locking(|| DbKeyStore::new(config.clone())).expect("store");
     let mut creds = Vec::with_capacity(entries);
     for i in 0..entries {
         let user = format!("user-{i}");
         let entry = store
             .build("stress-service", user.as_str(), None)
             .expect("build entry");
-        retry_locking(|| entry.set_secret(b"init")).expect("seed secret");
+        let init = Zeroizing::new(b"init".to_vec());
+        retry_locking(|| entry.set_secret(init.as_slice())).expect("seed secret");
         creds.push(entry);
         std::thread::sleep(Duration::from_millis(20)); // allow the other process to squeeze in periodically
     }
@@ -195,10 +197,10 @@ fn stress_random_rw_child() {
     while start.elapsed() < deadline {
         let idx = (rng.next_u32() as usize) % creds.len();
         let entry = &creds[idx];
-        if rng.next_u32() % 2 == 0 {
-            let _ = retry_locking(|| entry.get_secret()).expect("get_secret");
+        if rng.next_u32().is_multiple_of(2) {
+            let _secret = Zeroizing::new(retry_locking(|| entry.get_secret()).expect("get_secret"));
         } else {
-            let secret = format!("secret-{id}-{idx}-{counter}");
+            let secret = Zeroizing::new(format!("secret-{id}-{idx}-{counter}"));
             counter = counter.wrapping_add(1);
             retry_locking(|| entry.set_secret(secret.as_bytes())).expect("set_secret");
         }
@@ -215,15 +217,14 @@ fn file_size_by_entry_count() {
             path: path.clone(),
             ..Default::default()
         };
-        let store = DbKeyStore::new(&config).expect("store");
+        let store = DbKeyStore::new(config).expect("store");
         for i in 0..count {
             let user = format!("user-{i}");
             let entry = store
                 .build("size-service", user.as_str(), None)
                 .expect("build entry");
-            entry
-                .set_secret(format!("secret-{i}").as_bytes())
-                .expect("set_secret");
+            let secret = Zeroizing::new(format!("secret-{i}"));
+            entry.set_secret(secret.as_bytes()).expect("set_secret");
         }
         let total = file_set_size(&path);
         println!("file_size entries={count} bytes={total}");
@@ -246,18 +247,17 @@ fn perf_index_always_lookup() {
                 index_always,
                 ..Default::default()
             };
-            let store = DbKeyStore::new(&config).expect("store");
+            let store = DbKeyStore::new(config).expect("store");
             for i in 0..count {
                 let user = format!("user-{i}");
                 let entry = store
                     .build("perf-service", user.as_str(), None)
                     .expect("build entry");
-                entry
-                    .set_secret(format!("secret-{i}").as_bytes())
-                    .expect("set_secret");
+                let secret = Zeroizing::new(format!("secret-{i}"));
+                entry.set_secret(secret.as_bytes()).expect("set_secret");
             }
 
-            let lookups = std::cmp::max(100, std::cmp::min(1000, count * 10));
+            let lookups = (count * 10).clamp(100, 1000);
             let start = Instant::now();
             for i in 0..lookups {
                 let idx = i % count;
@@ -265,7 +265,7 @@ fn perf_index_always_lookup() {
                 let entry = store
                     .build("perf-service", user.as_str(), None)
                     .expect("build entry");
-                let _ = entry.get_secret().expect("get_secret");
+                let _secret = Zeroizing::new(entry.get_secret().expect("get_secret"));
             }
             let elapsed = start.elapsed();
             println!(

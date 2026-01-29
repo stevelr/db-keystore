@@ -20,6 +20,7 @@ rnk.use_named_store(
 )
 # print(f"store info: {rnk.store_info()}")
 
+# NOTE: Python strings are immutable and cannot be zeroized. Avoid using real secrets here.
 # set password for first user
 entry = rnk.Entry("example-app", "alice")
 entry.set_password("secret!")

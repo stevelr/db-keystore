@@ -2,11 +2,12 @@
 	"version": "0.2",
 	"language": "en",
 	"dictionaries": ["rust"],
-	"ignorePaths": ["target/", "Cargo.lock"],
+	"ignorePaths": ["target/", "Cargo.lock", "tmp/"],
 	"ignoreRegExpList": [],
 	"words": [
 		"creds",
 		"dromomeryx",
+		"hexdigit",
 		"hexkey",
 		"macbook",
 		"maturin",
@@ -19,6 +20,10 @@
 		"turso",
 		"uidx",
 		"uring",
-		"wrongkey"
+		"wrongkey",
+		"zeroize",
+		"zeroized",
+		"zeroizes",
+		"Zeroizing"
 	]
 }

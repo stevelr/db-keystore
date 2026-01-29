@@ -53,10 +53,7 @@ fn open_db() -> Result<Arc<DbKeyStore>> {
 fn open_encrypted(dir: &Path, hexkey: &str) -> Result<Arc<DbKeyStore>> {
     let config = DbKeyStoreConfig {
         path: dir.join("keystore.db"),
-        encryption_opts: Some(EncryptionOpts {
-            cipher: "aegis256".to_string(),
-            hexkey: hexkey.to_string(),
-        }),
+        encryption_opts: Some(EncryptionOpts::new("aegis256", hexkey)),
         ..Default::default()
     };
     DbKeyStore::new(&config)
@@ -79,18 +76,22 @@ use db_keystore::{DbKeyStore, DbKeyStoreConfig, EncryptionOpts};
 use keyring_core::{Entry, Result, api::CredentialStoreApi};
 use std::{collections::HashMap, sync::Arc};
 
-fn save_secrets(db: Arc<DbKeyStore>) -> Result<()> {
+fn save_password(db: Arc<DbKeyStore>, service: &str, user: &str, password: &str) -> Result<()> {
     // use `set_password` to store secrets that are utf8 strings
     // service and user must be non-empty
-    let entry = db.build("demo", "bob", None)?;
-    entry.set_password("dromomeryx")?;
+    let entry = db.build(service, user, None)?;
+    entry.set_password(password)
+}
 
+fn save_secret(db: Arc<DbKeyStore>, service: &str, user: &str, secret: &[u8]) -> Result<()> {
     // use `set_secret` to store any binary secret (up to 64KiB)
     // service and user must be non-empty
-    let bin_entry = db.build("demo", "alice", None)?;
-    bin_entry.set_secret(b"\x00\xff\x80\x81")?;
-    Ok(())
+    let bin_entry = db.build(service, user, None)?;
+    bin_entry.set_secret(secret)
 }
+
+// Note: db-keystore zeroizes temporary secret buffers it owns, but secrets passed into Turso
+// may be copied internally and are not currently zeroized on drop.
 
 
 /// Verify secret. Returns true if there is a matching password for the service+user

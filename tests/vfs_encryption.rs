@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use db_keystore::{DbKeyStore, DbKeyStoreConfig, EncryptionOpts};
 use keyring_core::api::CredentialStoreApi;
+use zeroize::Zeroizing;
 
 const HEXKEY_256: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
@@ -9,10 +10,7 @@ const HEXKEY_256: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a
 fn encryption_round_trip_requires_key() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("encrypted.db");
-    let encryption_opts = Some(EncryptionOpts {
-        cipher: "aes256gcm".to_string(),
-        hexkey: HEXKEY_256.to_string(),
-    });
+    let encryption_opts = Some(EncryptionOpts::new("aes256gcm", HEXKEY_256));
 
     {
         let config = DbKeyStoreConfig {
@@ -20,11 +18,12 @@ fn encryption_round_trip_requires_key() {
             encryption_opts: encryption_opts.clone(),
             ..Default::default()
         };
-        let store = DbKeyStore::new(&config).expect("create encrypted store");
+        let store = DbKeyStore::new(config).expect("create encrypted store");
         let entry = store
             .build("enc-service", "enc-user", None)
             .expect("build entry");
-        entry.set_password("dromomeryx").expect("set_password");
+        let password = Zeroizing::new("dromomeryx".to_string());
+        entry.set_password(password.as_str()).expect("set_password");
     }
 
     {
@@ -33,19 +32,19 @@ fn encryption_round_trip_requires_key() {
             encryption_opts: encryption_opts.clone(),
             ..Default::default()
         };
-        let store = DbKeyStore::new(&config).expect("reopen encrypted store");
+        let store = DbKeyStore::new(config).expect("reopen encrypted store");
         let entry = store
             .build("enc-service", "enc-user", None)
             .expect("build entry");
-        let value = entry.get_password().expect("get_password");
-        assert_eq!(value, "dromomeryx");
+        let value = Zeroizing::new(entry.get_password().expect("get_password"));
+        assert_eq!(value.as_str(), "dromomeryx");
     }
 
     let config = DbKeyStoreConfig {
         path,
         ..Default::default()
     };
-    let result = std::panic::catch_unwind(|| DbKeyStore::new(&config));
+    let result = std::panic::catch_unwind(|| DbKeyStore::new(config));
     assert!(
         matches!(result, Ok(Err(_)) | Err(_)),
         "opening encrypted db without keys should fail"
@@ -62,9 +61,10 @@ fn vfs_memory_is_accepted() {
     let entry = store
         .build("vfs-service", "vfs-user", None)
         .expect("build entry");
-    entry.set_password("dromomeryx").expect("set_password");
-    let value = entry.get_password().expect("get_password");
-    assert_eq!(value, "dromomeryx");
+    let password = Zeroizing::new("dromomeryx".to_string());
+    entry.set_password(password.as_str()).expect("set_password");
+    let value = Zeroizing::new(entry.get_password().expect("get_password"));
+    assert_eq!(value.as_str(), "dromomeryx");
 }
 
 #[cfg(target_os = "linux")]
@@ -77,11 +77,12 @@ fn vfs_io_uring_is_accepted() {
         vfs: Some("io_uring".to_string()),
         ..Default::default()
     };
-    let store = DbKeyStore::new(&config).expect("vfs io_uring store");
+    let store = DbKeyStore::new(config).expect("vfs io_uring store");
     let entry = store
         .build("vfs-service", "vfs-user", None)
         .expect("build entry");
-    entry.set_password("dromomeryx").expect("set_password");
-    let value = entry.get_password().expect("get_password");
-    assert_eq!(value, "dromomeryx");
+    let password = Zeroizing::new("dromomeryx".to_string());
+    entry.set_password(password.as_str()).expect("set_password");
+    let value = Zeroizing::new(entry.get_password().expect("get_password"));
+    assert_eq!(value.as_str(), "dromomeryx");
 }
