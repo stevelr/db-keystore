@@ -12,20 +12,21 @@
 use db_keystore::DbKeyStore;
 use keyring_core::{Entry, api::CredentialStoreApi};
 use std::{collections::HashMap, path::PathBuf};
+use zeroize::{Zeroize, Zeroizing};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut modifiers = HashMap::new();
+    let mut args: Vec<String> = std::env::args().collect();
+    let mut modifiers: HashMap<String, String> = HashMap::new();
     let mut path = None;
     for arg in args[1..].iter() {
         if let Some((key, val)) = arg.split_once('=') {
             if key == "path" {
                 path = Some(val);
             }
-            modifiers.insert(key, val);
+            modifiers.insert(key.to_string(), val.to_string());
         } else if path.is_none() {
             path = Some(arg);
-            modifiers.insert("path", arg);
+            modifiers.insert("path".to_string(), arg.to_string());
         } else {
             return Err(format!("Invalid arg '{}'. Expecting key=value", arg).into());
         }
@@ -46,7 +47,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let store = DbKeyStore::new_with_modifiers(&modifiers)?;
+    let modifiers_ref: HashMap<&str, &str> = modifiers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let store = DbKeyStore::new_with_modifiers(&modifiers_ref)?;
+    for value in modifiers.values_mut() {
+        value.zeroize();
+    }
+    for arg in args.iter_mut() {
+        arg.zeroize();
+    }
     let entries: Vec<Entry> = store.search(&HashMap::new())?;
     println!(
         "DbKeyStore {}. Listing {} keys:",
@@ -55,8 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for entry in entries.iter() {
         let (service, user) = entry.get_specifiers().unwrap();
-        let password = entry.get_password().unwrap_or_default();
-        println!("{service}\t{user}\t{password}");
+        let password = Zeroizing::new(entry.get_password().unwrap_or_default());
+        println!("{service}\t{user}\t{}", password.as_str());
     }
     Ok(())
 }

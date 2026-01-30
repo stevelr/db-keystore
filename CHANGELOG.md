@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Breaking
+
+- `EncryptionOpts.hexkey` now uses `zeroize::Zeroizing<String>` and `EncryptionOpts::new` was added for construction.
+- All input uuids are converted to lowercase and validated with a regex, returning Error::Invalid for incorrect format.
+
+### Added
+
+- binary db-keystore maintenance/admin utility
+
+### Changed
+
+- Changed uuid generation from v4 to v7 so ambiguous entries can be sorted by creation time (only applies to automatically inserted uuids, which are generated with uuid::now_v7()).
+- Empty comment strings are normalized to NULL on insert/update; comment search with empty string now matches NULL/empty comments only.
+- Reduced secret heap residency by zeroizing temporary buffers in fetch paths and examples.
+- Implemented `get_password` in this crate to avoid extra secret copies.
+
+### Documentation
+
+- Updated README, examples, and tests to demonstrate zeroizing caller-side secret handling.
+
 ## [0.3.1] - 2026-01-28
 
 ### Added
