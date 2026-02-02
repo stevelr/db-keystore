@@ -15,10 +15,6 @@ rust-version = "1.88"
 [lib]
 
 [[bin]]
-name = "dump-db-keystore"
-path = "bin/dump-db-keystore.rs"
-
-[[bin]]
 name = "db-keystore"
 path = "bin/db-keystore.rs"
 

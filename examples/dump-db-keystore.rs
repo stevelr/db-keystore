@@ -1,6 +1,6 @@
 //! Dump all keys in sqlite keystore to stdout.
 //!
-//! Syntax: dump [PATH] key=val ...
+//! Syntax: dump-db-keystore [PATH] key=val ...
 //!    PATH is path to existing database, defaults to ~/.local/state/keystore.db
 //!    Additional args are modifiers. For encryption, use keys 'cipher' and 'hexkey'
 //!   

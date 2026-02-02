@@ -4,12 +4,15 @@ Platform-independent, SQLite-backed credential store for the `keyring-core` API,
 
 This crate implements [`keyring-core`](https://crates.io/crates/keyring-core)::[`CredentialStoreApi`](https://docs.rs/keyring-core/latest/keyring_core/api/trait.CredentialStoreApi.html) and [`CredentialApi`](https://docs.rs/keyring-core/latest/keyring_core/api/trait.CredentialApi.html).
 
+There is a binary [maintenance tool](#maintenance-tool) for adjusting db settings and rotating encryption keys.
+
 ## Features
 
 - Rust-native SQLite implementation by [turso](https://crates.io/crates/turso), with open source encryption.
 - WAL + busy timeout for safety in multi-process environments.
 - Optional uniqueness enforcement on `(service, user)`.
 - UUID and optional `comment` attributes exposed via the credential API.
+- UUIDs created with format v7, allowing sort-by-time for ambiguous entries.
 - Search with regex filters over `service`, `user`, `uuid`, and `comment`.
 - Several [Examples](./examples)
 
@@ -46,7 +49,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 /// Open in default location (~/.local/state/keystore.db)
 fn open_db() -> Result<Arc<DbKeyStore>> {
     let config = DbKeyStoreConfig::default();
-    DbKeyStore::new(&config)
+    DbKeyStore::new(config)
 }
 
 /// Open encrypted database in custom folder
@@ -56,7 +59,7 @@ fn open_encrypted(dir: &Path, hexkey: &str) -> Result<Arc<DbKeyStore>> {
         encryption_opts: Some(EncryptionOpts::new("aegis256", hexkey)),
         ..Default::default()
     };
-    DbKeyStore::new(&config)
+    DbKeyStore::new(config)
 }
 
 /// Open in-memory db
@@ -65,7 +68,7 @@ fn open_in_memory() -> Result<Arc<DbKeyStore>> {
         vfs: Some("memory".to_string()),
         ..Default::default()
     };
-    DbKeyStore::new(&config)
+    DbKeyStore::new(config)
 }
 ```
 
@@ -90,10 +93,6 @@ fn save_secret(db: Arc<DbKeyStore>, service: &str, user: &str, secret: &[u8]) ->
     bin_entry.set_secret(secret)
 }
 
-// Note: db-keystore zeroizes temporary secret buffers it owns, but secrets passed into Turso
-// may be copied internally and are not currently zeroized on drop.
-
-
 /// Verify secret. Returns true if there is a matching password for the service+user
 fn verify_secret(db: Arc<DbKeyStore>, service: &str, user: &str, expected: &[u8]) -> Result<bool> {
     let spec = HashMap::from([("service", service), ("user", user)]);
@@ -113,7 +112,7 @@ fn search(
     uuid_re: Option<&str>, comment_re: Option<&str>,
 ) -> Result<Vec<Entry>> {
     let mut spec = HashMap::new();
-    /// `search` supports keys: `service`, `user`, `uuid`, `comment`.
+    // `search` supports keys: `service`, `user`, `uuid`, `comment`.
     if let Some(service) = service_re { spec.insert("service", service); }
     if let Some(user) = user_re { spec.insert("user", user); }
     if let Some(uuid) = uuid_re { spec.insert("uuid", uuid); }
@@ -122,12 +121,48 @@ fn search(
 }
 ```
 
-### Debugging tool
+## Changing database settings
 
-The `dump-db-keystore` debugging tool prints all entries in the keystore. It accepts an optional path and modifier key/value pairs. For encrypted databases, args must include `cipher` and `hexkey`.
+If you decide to change the database configuration after the database has been created, a bit of maintenance with the `db-keystore` maintenance tool is required.
+
+### Changing encryption
+
+To change database encryption (adding encryption, removing encryption, rotating the key, or changing the cipher), use `db-keystore rekey`
+
+### Changing allow_ambiguous from false to true
+
+To change a database to allow ambiguous entries, Use `db-keystore allow-ambiguous` to remove the unique index. Then the db can be opened with `DbKeyStoreConfig::allow_ambiguous: true`.
+
+### Changing allow_ambiguous from true to false
+
+To change a database to disable ambiguity, you must first ensure there are no ambiguous entries in the keystore, or the creation of the unique index will fail.
+
+List the ambiguous entries with `db-keystore list --ambiguous` and use `db-keystore delete ...` to remove conflicts. When there are no more results from `db-keystore list --ambiguous`, it is safe to open the database with `DbKeyStoreConfig::allow_ambiguous: false`.
+
+## Maintenance tool
+
+Install with `cargo install db-keystore` (or from source `cargo install --path .`)
 
 ```sh
-cargo run --bin dump-db-keystore -- path=/tmp/keystore.db cipher=aegis256 hexkey=...
+# Global args
+#  --path PATH      # path to keystore. defaults to ~/.local/state/keystore.db
+#  --cipher CIPHER  # encryption cipher
+#  --hexkey HEXKEY  # encryption key
+#  --json           # output list commands in json instead of tsv
+
+
+# list credentials in store (does not display secrets)
+db-keystore list
+
+# list ambiguous credentials (non-unique sets of (service,user))
+db-keystore list --ambiguous
+
+# delete one or more credentials in keystore
+db-keystore delete [--service SERVICE] [--user USER] [--uuid UUID]
+
+# rotate keys (`rekey` can also be used to add or remove encryption)
+db-keystore rekey --path OLD_PATH --cipher OLD_CIPHER --hexkey OLD_KEY \
+                  --output NEW_PATH.db --new-cipher NEW_CIPHER --new-hexkey NEW_KEY
 ```
 
 ## Encryption
@@ -148,7 +183,6 @@ cargo run --bin dump-db-keystore -- path=/tmp/keystore.db cipher=aegis256 hexkey
 openssl rand -hex 32
 # generate 128-bit key as 32 hex digits
 openssl rand -hex 16
-
 ```
 
 ```rust
@@ -174,17 +208,11 @@ When using this or any encrypted storage, keep in mind that the greatest risks f
 - Generating keys from user input without a strong KDF (Argon2/scrypt) weakens security.
 - Storing encryption keys on disk with the database (or leaked in logs or environment) diminishes the benefits of encryption.
 
-## Release Notes (0.3.0)
+## Release Notes
 
-- `new_with_modifiers` now returns `Result<Arc<DbKeyStore>>` instead of `Result<DbKeyStore>`.
+See [CHANGELOG](https://github.com/stevelr/db-keystore/blob/main/CHANGELOG.md) for latest changes.
 
-## Release Notes (0.2.2)
-
-### Crash on incorrect decryption key
-
-In turso v0.4.3 (used in db-keystore 0.2.x and 0.3.0), attempting to open an encrypted database with the wrong key panics. The panic is fixed with turso [PR 4670](https://github.com/tursodatabase/turso/pull/4670), merged into the main branch on 2026-01-15. After this is released on crates.io, we'll release an updated db-keystore.
-
-A potential work-around is to catch the panic. [One of the examples](./examples/encrypted_wrongkey.rs) shows how to catch the panic.
+See [Issues](https://github.com/stevelr/db-keystore/issues) for known issues.
 
 ### Schema version
 
