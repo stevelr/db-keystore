@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [0.4.0]
+## [0.4.0] - 2026-02-02
 
 ### Breaking
 
@@ -15,12 +15,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 - binary db-keystore maintenance/admin utility
 - added msrv declaration (1.88)
+- bumped turso dependency to 0.4.4
 
 ### Changed
 
 - Changed uuid generation from v4 to v7 so ambiguous entries can be sorted by creation time (only applies to automatically inserted uuids, which are generated with uuid::now_v7()).
 - Empty comment strings are normalized to NULL on insert/update; comment search with empty string now matches NULL/empty comments only.
-- Reduced secret heap residency by zeroizing temporary buffers in fetch paths and examples.
+- Use zeroize internally to prevent secrets from leaking into heap
+- moved dump-db-keystore to examples
 
 ### Fixed
 
