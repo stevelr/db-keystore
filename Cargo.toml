@@ -20,7 +20,7 @@ path = "bin/db-keystore.rs"
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.5.56", features = ["derive"] }
+clap = { version = "4.5.57", features = ["derive"] }
 futures = "0.3.31"
 keyring-core = "0.7.2"
 log = "0.4.29"
