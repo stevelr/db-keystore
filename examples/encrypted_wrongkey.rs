@@ -1,6 +1,10 @@
-//! Demonstrates the panic when db is opened with the wrong key,
-//! and how to catch it. The panic will be fixed in an upcoming version of db-keystore
-//! after it's released in turso.
+//! In db-keystore 0.4.1 and greater, attempting to open an encrypted db-keystore
+//! with the wrong key returns error keyring_core::Error::NoStorageAccess.
+//! The panic was fixed in turso 0.5.0.
+//!
+//! In db-keystore-0.4.0 and earlier, (which used turso 0.4.x), opening an encrypted
+//! db with the wrong key caused a panic. This example was included to demonstrate
+//! how to catch the panic.
 //!
 
 use db_keystore::{DbKeyStore, DbKeyStoreConfig, EncryptionOpts};
@@ -54,14 +58,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("opened ok");
                 store
             }
-            // Some other open error
-            Ok(Err(e)) => {
-                eprintln!("Open failed: {e:?}");
-                std::process::exit(1);
+            Ok(Err(err)) => {
+                if let keyring_core::Error::NoStorageAccess(msg) = &err {
+                    eprintln!("{msg}"); // Invalid encryption key or cipher ...
+                    std::process::exit(1);
+                } else {
+                    eprintln!("Open failed: {err:?}");
+                    std::process::exit(1);
+                }
             }
-            // Wrong key
+            // Wrong key (for db-keystore <= 0.4.0)
             Err(panic_payload) => {
-                eprintln!("Panic caught opening encrypted db with wrong key.");
+                eprintln!(
+                    "Panic caught opening encrypted db with wrong key. Upgrade db-keystore to 0.4.1 or greater"
+                );
                 std::mem::forget(panic_payload);
                 std::process::exit(1);
             }

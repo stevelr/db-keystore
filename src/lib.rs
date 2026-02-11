@@ -1214,6 +1214,7 @@ fn open_db_with_retry(
         match block_on(builder.build()) {
             Ok(db) => return Ok(db),
             Err(err) => {
+                check_decryption_error(&err)?;
                 if retries == 0 || !is_turso_locking_error(&err) {
                     return Err(map_turso_err(err));
                 }
@@ -1261,6 +1262,16 @@ fn is_turso_locking_error(err: &turso::Error) -> bool {
         || text.contains("database is busy")
         || text.contains("sqlite_busy")
         || text.contains("sqlite_locked")
+}
+
+fn check_decryption_error(err: &turso::Error) -> Result<()> {
+    let text = err.to_string();
+    if text.starts_with("Decryption failed") {
+        return Err(keyring_core::Error::NoStorageAccess(Box::new(
+            turso::Error::Error(format!("Invalid encryption key or cipher. {text}")),
+        )));
+    }
+    Ok(())
 }
 
 fn value_to_string(value: Value, field: &str) -> turso::Result<String> {
