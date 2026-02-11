@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.4.1]
+
+This version upgrades turso db to fix the panic when opening an encrypted db with the wrong key. Attempting to open with an incorrect encryption key causes `new` or `new_with_modifiers` to fail with NoStorageAccess.
+
+### Changed
+
+- upgrade turso from 0.4.4 to 0.5.0-pre.8
+- unpinned uuid dependency (was pinned to 1.20.0)
+- bumped tempfile to 3.25
+
 ## [0.4.0] - 2026-02-02
 
 ### Breaking

@@ -1,6 +1,6 @@
 [package]
 name = "db-keystore"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 authors = ["Steve Schoettler <stevelr-git@pm.me>"]
 description = "SQLite-backed credential store for the `keyring-core` API"
@@ -19,17 +19,17 @@ name = "db-keystore"
 path = "bin/db-keystore.rs"
 
 [dependencies]
-anyhow = "1.0"
-clap = { version = "4.5.56", features = ["derive"] }
+anyhow = "1.0.101"
+clap = { version = "4.5.57", features = ["derive"] }
 futures = "0.3.31"
 keyring-core = "0.7.2"
 log = "0.4.29"
-regex = "1.12.2"
-serde = { version = "1.0.218", features = ["derive"] }
-serde_json = "1.0.139"
-turso = "0.4.4"
-uuid = { version = "=1.20.0", features = ["v7"] }
-zeroize = "1.8.1"
+regex = "1.12.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+turso = "0.5.0-pre.8"
+uuid = { version = "1.20.0", features = ["v7"] }
+zeroize = "1.8.2"
 
 [dev-dependencies]
-tempfile = "=3.24.0"
+tempfile = "3.25.0"
