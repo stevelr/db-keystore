@@ -4,9 +4,10 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [Unreleased]
+## [0.4.2-pre.1]
 
-- bump dependencies: turso -> 0.5.0-pre.13, uuid -> 1.21, +patch updates
+- bump dependencies: turso ->0.5.3, clap 4.5.60->4.6.1, tempfile 3.25.0->3.27.0, uuid->1.22.0, keyring-core 0.7.2->0.7.4, other patch updates
+- bump to turso 0.5.3 fixes #6 (panic on incorrect decryption key)
 
 ## [0.4.1]
 
