@@ -1,6 +1,6 @@
 [package]
 name = "db-keystore"
-version = "0.4.2-pre.1"
+version = "0.4.2-pre.2"
 edition = "2024"
 authors = ["Steve Schoettler <stevelr-git@pm.me>"]
 description = "SQLite-backed credential store for the `keyring-core` API"
@@ -27,7 +27,7 @@ log = "0.4.29"
 regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-turso = "0.5.3"
+turso = "0.6.0-pre.22"
 uuid = { version = "1.22.0", features = ["v7"] }
 zeroize = "1.8.2"
 

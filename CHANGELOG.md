@@ -4,8 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [Unreleased]
+## [0.4.2-pre.2]
 
+- bump turso -> 0.6.0-pre.22; keyring-core -> 1.0.0
 
 ## [0.4.2-pre.1]
 
