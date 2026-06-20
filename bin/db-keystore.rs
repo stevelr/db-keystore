@@ -26,7 +26,7 @@
 //!
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
-use db_keystore::{DbKeyStore, DbKeyStoreConfig, EncryptionOpts};
+use db_keystore::{DbKeyStore, EncryptionOpts};
 use keyring_core::{Entry, Error as KeyringError, api::CredentialStoreApi};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -224,33 +224,25 @@ fn cmd_rekey(
         args.output.display()
     );
 
-    let store = open_store(&resolved_path, &cipher_opts)?;
-    let encrypted = store.is_encrypted();
-
     let new_cipher_opts = validate_cipher_and_key(args.new_cipher, args.new_hexkey)?;
-    if !encrypted && new_cipher_opts.is_none() {
+    if cipher_opts.is_none() && new_cipher_opts.is_none() {
         bail!("database is not encrypted; --new-cipher and --new-hexkey are required");
     }
 
-    let allow_ambiguity = detect_allow_ambiguity(&resolved_path, &cipher_opts)?;
-
-    let encryption_opts = new_cipher_opts
+    let source_opts = cipher_opts
         .as_ref()
         .map(|(cipher, hexkey)| EncryptionOpts::new(cipher.clone(), hexkey.as_str().to_string()));
-    let config = DbKeyStoreConfig {
-        path: args.output.clone(),
-        allow_ambiguity,
-        encryption_opts,
-        ..Default::default()
-    };
-    let new_store = DbKeyStore::new(config).context("failed to create new keystore")?;
+    let dest_opts = new_cipher_opts
+        .as_ref()
+        .map(|(cipher, hexkey)| EncryptionOpts::new(cipher.clone(), hexkey.as_str().to_string()));
 
-    let entries = store
-        .search(&HashMap::new())
-        .context("failed to read entries for rekey")?;
-    for entry in entries {
-        copy_entry(&entry, &new_store)?;
-    }
+    let outcome = DbKeyStore::rekey(&resolved_path, source_opts, &args.output, dest_opts)
+        .context("rekey failed")?;
+    eprintln!(
+        "rekeyed {} credential(s) to '{}'",
+        outcome.copied,
+        args.output.display()
+    );
 
     Ok(0)
 }
@@ -418,40 +410,6 @@ fn delete_by_service_user(store: &DbKeyStore, service: &str, user: &str) -> Resu
 fn normalize_uuid(value: &str) -> Result<String> {
     let uuid = uuid::Uuid::parse_str(value).context("invalid uuid format")?;
     Ok(uuid.to_string())
-}
-
-fn copy_entry(entry: &Entry, new_store: &DbKeyStore) -> Result<()> {
-    let (service, user) = entry
-        .get_specifiers()
-        .context("entry missing service/user")?;
-    let attrs = entry.get_attributes()?;
-    let uuid = attrs.get("uuid").cloned().context("entry missing uuid")?;
-    let comment = attrs.get("comment").cloned();
-
-    let mut mods: HashMap<&str, &str> = HashMap::new();
-    mods.insert("uuid", uuid.as_str());
-    if let Some(comment) = comment.as_deref() {
-        mods.insert("comment", comment);
-    }
-
-    let new_entry = new_store.build(service.as_str(), user.as_str(), Some(&mods))?;
-
-    let secret = Zeroizing::new(entry.get_secret()?);
-    new_entry.set_secret(secret.as_slice())?;
-    Ok(())
-}
-
-fn detect_allow_ambiguity(
-    path: &Path,
-    cipher_opts: &Option<(String, Zeroizing<String>)>,
-) -> Result<bool> {
-    let conn = open_conn(path, cipher_opts.as_ref())?;
-    let has_unique_index = find_unique_service_user_index(&conn)?.is_some();
-    if has_unique_index {
-        return Ok(false);
-    }
-    let has_table_unique = table_has_unique_service_user(&conn)?;
-    Ok(!has_table_unique)
 }
 
 fn open_conn(path: &Path, cipher_opts: Option<&(String, Zeroizing<String>)>) -> Result<Connection> {

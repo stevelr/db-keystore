@@ -241,7 +241,7 @@ impl DbKeyStore {
                     .build()
                     .await
             }))?;
-            let id = format!("DbKeyStore v{CRATE_VERSION} in-memory @ {start_time}",);
+            let id = format!("DbKeyStore v{CRATE_VERSION} in-memory @ {start_time}");
             let conn = map_turso(db.connect())?;
             (
                 DbKeyStore {
@@ -351,6 +351,142 @@ impl DbKeyStore {
     /// Returns path to database file
     pub fn path(&self) -> String {
         self.inner.path.clone()
+    }
+
+    /// Rekey a keystore out-of-place: read every credential from the source
+    /// database and write it into a freshly created destination database.
+    ///
+    /// This is used to add, remove, or rotate the on-disk encryption key (a DEK
+    /// rotation): pass `dest_opts = Some(..)` to add or rotate encryption, or
+    /// `dest_opts = None` to write an unencrypted copy. `source_opts` must
+    /// supply the cipher/key the source was written with (or `None` if the
+    /// source is unencrypted).
+    ///
+    /// The operation is non-destructive to the source: the source database is
+    /// opened read-only-ish (no rows are mutated) and left fully intact, and the
+    /// destination is fully written before returning. Callers that own a
+    /// verify-then-swap-then-delete sequence (for example secret-vault
+    /// rotate-dek) should treat the returned destination as the new candidate
+    /// and only retire the source after independently verifying it.
+    ///
+    /// Each credential is copied with its `service`, `user`, `uuid`, `comment`,
+    /// and `secret` preserved. Whether the source enforced `(service, user)`
+    /// uniqueness is detected from the source schema and mirrored on the
+    /// destination so ambiguous keystores round-trip unchanged.
+    ///
+    /// `dest_path` must not already exist. Returns a [`RekeyOutcome`] describing
+    /// how many credentials were copied. No secret material is logged or
+    /// included in any returned value.
+    pub fn rekey(
+        source_path: impl AsRef<Path>,
+        source_opts: Option<EncryptionOpts>,
+        dest_path: impl AsRef<Path>,
+        dest_opts: Option<EncryptionOpts>,
+    ) -> Result<RekeyOutcome> {
+        let source_path = source_path.as_ref();
+        let dest_path = dest_path.as_ref();
+
+        if !source_path.is_file() {
+            return Err(Error::NoStorageAccess(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no source database at '{}'", source_path.display()),
+            ))));
+        }
+        if dest_path.exists() {
+            return Err(Error::Invalid(
+                "dest_path".to_string(),
+                format!("destination path '{}' already exists", dest_path.display()),
+            ));
+        }
+
+        let source = DbKeyStore::new(DbKeyStoreConfig {
+            path: source_path.to_path_buf(),
+            encryption_opts: source_opts,
+            // open permissively so we can read ambiguous keystores; uniqueness
+            // is detected from the schema below and mirrored on the destination.
+            allow_ambiguity: true,
+            ..Default::default()
+        })?;
+
+        let allow_ambiguity = source.detect_allow_ambiguity()?;
+
+        let dest = DbKeyStore::new(DbKeyStoreConfig {
+            path: dest_path.to_path_buf(),
+            encryption_opts: dest_opts,
+            allow_ambiguity,
+            ..Default::default()
+        })?;
+
+        let entries = source.read_all_for_rekey()?;
+        let copied = entries.len();
+        for entry in &entries {
+            dest.write_for_rekey(entry)?;
+        }
+
+        Ok(RekeyOutcome { copied })
+    }
+
+    /// Detect whether the source schema enforces `(service, user)` uniqueness.
+    /// Returns `true` if ambiguous entries are permitted (no unique constraint).
+    fn detect_allow_ambiguity(&self) -> Result<bool> {
+        let conn = self.inner.connect()?;
+        let has_unique = map_turso(block_on(schema_has_unique_service_user(&conn)))?;
+        Ok(!has_unique)
+    }
+
+    /// Read every credential (including secret) for an out-of-place rekey copy.
+    fn read_all_for_rekey(&self) -> Result<Vec<RekeyRecord>> {
+        let conn = self.inner.connect()?;
+        map_turso(block_on(query_all_for_rekey(&conn)))
+    }
+
+    /// Insert one credential into this (destination) store, preserving its
+    /// service, user, uuid, comment, and secret.
+    fn write_for_rekey(&self, record: &RekeyRecord) -> Result<()> {
+        validate_service_user(&record.service, &record.user)?;
+        validate_secret(&record.secret)?;
+        let credential = DbKeyCredential {
+            inner: Arc::clone(&self.inner),
+            id: CredId {
+                service: record.service.clone(),
+                user: record.user.clone(),
+            },
+            uuid: Some(normalize_uuid_input(&record.uuid)?),
+            comment: record.comment.clone(),
+        };
+        credential.set_secret(record.secret.as_slice())
+    }
+}
+
+/// Result of a [`DbKeyStore::rekey`] operation.
+///
+/// Intentionally carries no secret material so it is safe to log or format.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RekeyOutcome {
+    /// Number of credentials copied from source to destination.
+    pub copied: usize,
+}
+
+/// One credential read from the source during rekey. The `secret` is held in a
+/// `Zeroizing` buffer so it is wiped from the heap when the record is dropped.
+struct RekeyRecord {
+    service: String,
+    user: String,
+    uuid: String,
+    comment: Option<String>,
+    secret: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for RekeyRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // never expose the secret in Debug output
+        f.debug_struct("RekeyRecord")
+            .field("service", &self.service)
+            .field("user", &self.user)
+            .field("uuid", &self.uuid)
+            .field("comment", &self.comment)
+            .field("secret", &"<redacted>")
+            .finish()
     }
 }
 
@@ -1002,6 +1138,64 @@ async fn query_all_credentials(
         results.push((CredId { service, user }, uuid, comment));
     }
     Ok(results)
+}
+
+/// Read every credential, including its secret, for an out-of-place rekey copy.
+async fn query_all_for_rekey(conn: &Connection) -> turso::Result<Vec<RekeyRecord>> {
+    let mut rows = conn
+        .query(
+            "SELECT service, user, uuid, secret, comment FROM credentials",
+            (),
+        )
+        .await?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let service = value_to_string(row.get_value(0)?, "service")?;
+        let user = value_to_string(row.get_value(1)?, "user")?;
+        let uuid = value_to_string(row.get_value(2)?, "uuid")?;
+        let secret = value_to_secret(row.get_value(3)?, "secret")?;
+        let comment = value_to_option_string(row.get_value(4)?, "comment")?;
+        results.push(RekeyRecord {
+            service,
+            user,
+            uuid,
+            comment,
+            secret,
+        });
+    }
+    Ok(results)
+}
+
+/// Returns true if the `credentials` schema enforces `(service, user)`
+/// uniqueness, either via a unique index or a table-level unique constraint.
+async fn schema_has_unique_service_user(conn: &Connection) -> turso::Result<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master \
+             WHERE (type = 'index' AND tbl_name = 'credentials') \
+                OR (type = 'table' AND name = 'credentials') \
+             AND sql IS NOT NULL",
+            (),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        match row.get_value(0)? {
+            Value::Text(sql) if is_unique_service_user_sql(sql.as_str()) => return Ok(true),
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// True if a `sqlite_master.sql` definition enforces uniqueness on
+/// `(service, user)` (whitespace/quote/case insensitive).
+fn is_unique_service_user_sql(sql: &str) -> bool {
+    let normalized: String = sql
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '"' && *c != '`')
+        .flat_map(char::to_lowercase)
+        .collect();
+    normalized.contains("unique") && normalized.contains("(service,user)")
 }
 
 async fn fetch_uuids(conn: &Connection, id: &CredId) -> turso::Result<Vec<String>> {
