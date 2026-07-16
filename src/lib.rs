@@ -730,7 +730,7 @@ impl DbKeyCredential {
                     // if ambiguity is not allowed, unique index should have prevented this case
                     return Err(Error::PlatformFailure(format!(
                         "Database is in an invalid state: ambiguity not allowed, but multiple entries found for {:?}",
-                        &self.id
+                        self.id
                     ).into()));
                 }
             }
@@ -880,7 +880,7 @@ impl CredentialApi for DbKeyCredential {
             self.get_attributes()?;
             return Ok(());
         }
-        let comment = comment.and_then(|value| if value.is_empty() { None } else { Some(value) });
+        let comment = comment.filter(|value| !value.is_empty());
         let make_comment_value = || comment_value(comment.as_ref());
         let conn = self.inner.connect()?;
         block_on(async {
