@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## 0.4.4
+
+**Added**
+
+- Public rekey api `DbKeyStore::rekey`. Moved functionality from cli to library
+  so it can be used programmatically.
+  Use to change encryption key, add encryption, or remove encryption.
+  Requires quiescent database.
+
+**Changed**
+
+- Bumped turso dependency from 0.6.1 to 0.7.0
+
 ## [0.4.3]
 
 **Changed**
