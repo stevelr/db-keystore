@@ -56,7 +56,7 @@ fn open_db() -> Result<Arc<DbKeyStore>> {
 fn open_encrypted(dir: &Path, hexkey: &str) -> Result<Arc<DbKeyStore>> {
     let config = DbKeyStoreConfig {
         path: dir.join("keystore.db"),
-        encryption_opts: Some(EncryptionOpts::new("aegis256", hexkey)),
+        encryption_opts: Some(EncryptionOpts::new("aegis256", hexkey)?),
         ..Default::default()
     };
     DbKeyStore::new(config)
@@ -127,7 +127,7 @@ If you decide to change the database configuration after the database has been c
 
 ### Changing encryption
 
-To change database encryption (adding encryption, removing encryption, rotating the key, or changing the cipher), use `db-keystore rekey`
+To change database encryption (adding encryption, removing encryption, rotating the key, or changing the cipher), use `db-keystore rekey`, or the library API `DbKeyStore::rekey` (see the `rekey` module docs). Rekey writes to a freshly created destination file (mode 0600, never overwriting an existing file), verifies every copied record exactly against the source before reporting success, and leaves the source unchanged on any failure. On Linux, `rekey_at` offers a descriptor-relative variant for callers that need to pin the source and destination directories.
 
 ### Changing allow_ambiguous from false to true
 
@@ -207,6 +207,31 @@ When using this or any encrypted storage, keep in mind that the greatest risks f
 - Reusing the same key across databases increases the blast radius if a key leaks.
 - Generating keys from user input without a strong KDF (Argon2/scrypt) weakens security.
 - Storing encryption keys on disk with the database (or leaked in logs or environment) diminishes the benefits of encryption.
+
+## Hardening recommendations
+
+`db-keystore` guards all secrets and the db encryption key with zeroizing wrappers to prevent
+secrets being accidentally logged or leaking into heap, however we can only follow this practice
+on our side of the turso API boundary. turso uses ordinary `String` for the db encryption key
+and `Vec<u8>` for returning encrypted data, so secrets can leak into the heap when these objects
+are freed. In addition, turso may cache unencrypted pages in memory. To prevent unencrypted secrets
+from being swapped to disk, it is strongly recommended to disable swap for the process, disable
+swap for the system, and using an encrypted disk partition.
+
+- **Keep the unit out of swap.** For systemd services, add `MemorySwapMax=0` to the `[Service]`
+  section (needs cgroup v2 with memory accounting, the default on current distros). The kernel
+  then never swaps the pages.
+- **Disable or encrypt swap host-wide.** The simplest thing is to disable swap entirely.
+  If the host needs swap, encrypt it with a random per-boot key:
+  `swapDevices.*.randomEncryption.enable = true` on NixOS, or a `crypttab` entry keyed
+  from `/dev/urandom` with the `swap` option elsewhere. Setting `vm.swappiness` is only advisory
+  and not sufficient.
+- **Disable core dumps for the unit.** A crash dump of the process contains its heap, with cache
+  pages. Set `LimitCORE=0` in the unit and, where `systemd-coredump` is active, set
+  `Storage=none` in `coredump.conf` (or mask the socket) so nothing writes the heap to disk.
+- **Use drive encryption**. If you do all of the above you've kept the system from writing
+  secrets to disk, except for hibernation. A hibernation image contains all of RAM, even locked pages.
+  You want to ensure the hibernation image is encrypted at rest.
 
 ## Release Notes
 

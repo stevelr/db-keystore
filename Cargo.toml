@@ -1,16 +1,16 @@
 [package]
 name = "db-keystore"
-version = "0.4.4"
-edition = "2024"
+version = "0.5.0-pre.1"
 authors = ["Steve Schoettler <stevelr-git@pm.me>"]
-description = "Encrypted SQLite credential store for the `keyring-core` API, backed by turso"
-repository = "https://github.com/stevelr/db-keystore"
-homepage = "https://github.com/stevelr/db-keystore"
-license = "MIT or Apache-2.0"
-keywords = ["keyring", "credential", "sqlite", "turso", "secrets-manager"]
 categories = ["database", "api-bindings"]
+edition = "2024"
+homepage = "https://github.com/stevelr/db-keystore"
+keywords = ["keyring", "credential", "sqlite", "turso", "secrets-manager"]
+license = "MIT or Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/stevelr/db-keystore"
 rust-version = "1.88"
+description = "Encrypted SQLite credential store for the `keyring-core` API, backed by turso"
 
 [lib]
 
@@ -30,6 +30,9 @@ serde_json = "1.0.149"
 turso = { version = "0.7.0", default-features = false, features = ["mimalloc"] }
 uuid = { version = "1.22.0", features = ["v7"] }
 zeroize = "1.8.2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -4,6 +4,85 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## 0.5.0-pre.1
+
+New rekey API - moved from cli to library for reusability by external crates,
+and added verification and additional integrity controls.
+Database must be quiescent for rekey operation.
+See README.md for hardening best practice.
+
+**Highlights**
+
+- After rekey, every entry in destination is verified. In 0.4.x only the number
+  of entries was verified.
+- Fix: Source with invalid `schema_version` is rejected after read-only check.
+  In 0.4.x rekey cli, file was not opened read-only and could have initialized schema in it.
+
+**BREAKING**: `EncryptionOpts` fields are now private; the key is decoded from
+hex at construction into a `SensitiveKey` (wiped on drop) instead of being
+stored as an ordinary `String`. `EncryptionOpts::new(&str, &str)` borrows
+its arguments, validates the hex and its length against the cipher, and
+returns `Result`. Hex re-encoding for the database layer happens in a
+zeroizing buffer.
+
+**Added**
+
+- `DbKeyStore::rekey` rekey api. `rekey` does not run schema initialization against the
+  source, so a failed rekey can never modify the source database (the source
+  connection also no longer sets a persistent journal mode).
+- Failed rekeys clean up the partial destination, but only files whose
+  directory entries still match the inodes rekey itself created; pre-existing
+  or substituted files (including WAL/SHM sidecars) are rejected with
+  `DestinationExists`/`UnsafeDestination` and never deleted.
+- `SensitiveKey`: fixed-size zeroizing DEK container (`Zeroizing<[u8; 32]>`,
+  supports 128- and 256-bit keys). Constructors borrow caller-owned buffers
+  (`from_hex(&str)`, `from_bytes(&[u8])`), so callers are not required to use
+  any particular zeroizing library; accessors return internal references.
+- `RekeyError`: typed error enum for rekey (`WrongSourceKey`,
+  `CorruptSource`, `VerificationMismatch`, `DestinationExists`,
+  `UnsafeDestination`, `SourceReplaced`, `Panicked`, ...). Wrong-key and
+  malformed-database cases return errors and never panic (confirmed by test:
+  turso 0.7 returns `Err` on a wrong key; rekey additionally wraps the
+  operation in `catch_unwind` as defense in depth).
+- `rekey_at` (Linux): descriptor-relative rekey. Source and destination are
+  named relative to caller-owned directory descriptors; the destination and
+  its WAL/SHM sidecars are created with `openat` + `O_CREAT | O_EXCL |
+  O_NOFOLLOW`, mode `0600` from the instant of creation (`fchmod` pins it
+  against the umask), and the databases are opened through
+  `/proc/self/fd/<dirfd>/<name>` so directory substitution cannot redirect
+  any file turso touches. Before success, every directory entry (source,
+  destination, sidecars) is re-checked against the inode validated or created
+  at the start; a final-component swap in the window before turso's by-path
+  open is thereby detected (turso cannot yet open an already-created
+  descriptor, so it cannot be prevented outright — see module docs).
+- Exact rekey verification: `DbKeyStore::rekey` does not return success until
+  every record (`service`, `user`, `uuid`, `comment`, and secret bytes) has
+  been compared between source and destination, streaming one record at a
+  time (bounded memory). Records are copied byte- and storage-class-exact —
+  no case-folding, comment normalization, or type coercion — so verification
+  compares raw values for strict equality. A matching row count alone is
+  never accepted, and there is no `verified` flag to ignore — success means
+  verified. No digest of secrets (keyed or otherwise) is computed, persisted,
+  or returned.
+- Durable close: before returning success the destination WAL is checkpointed
+  (`TRUNCATE`), the file and its directory are fsynced, WAL/SHM sidecar files
+  are removed, and the WAL/SHM sidecars are pre-created with mode `0600` so
+  credential plaintext in the WAL is never world-readable.
+- Acceptance tests for the above in `tests/rekey.rs` and `src/rekey.rs`,
+  including: secret corruption with unchanged row count fails; identical
+  metadata with different secrets is detected; uncheckpointed source WAL
+  transactions are copied; wrong/missing source keys error without panic;
+  existing files and symlinks (including dangling) are rejected; destination
+  is created `0600`; an interrupted rekey removes the partial destination and
+  leaves the source unchanged and usable.
+
+**Known limitation**
+
+- turso 0.7 caches unencrypted pages, and does not zeroize encryption key
+  (stored as `String`) or decrypted blobs (`Vec<u8`). While all buffers in
+  db-keystore are zeroized, we don't have control of the turso side of
+  the api boundary.
+
 ## 0.4.4
 
 **Added**

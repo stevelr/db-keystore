@@ -20,7 +20,7 @@ fn create_db_config(
     cipher: &str,
     hexkey: &str,
 ) -> Result<Arc<DbKeyStore>, keyring_core::Error> {
-    let encryption_opts = EncryptionOpts::new(cipher, hexkey);
+    let encryption_opts = EncryptionOpts::new(cipher, hexkey)?;
     let config = DbKeyStoreConfig {
         path: path.to_owned(),
         encryption_opts: Some(encryption_opts),

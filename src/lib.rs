@@ -7,6 +7,8 @@
 //!
 //! Features:
 //! - Local sqlite storage with optional encryption options.
+//! - Verified out-of-place rekey (DEK rotation) with safe destination
+//!   creation and typed errors: see the [`rekey`] module.
 //! - WAL + busy timeout for better multi-process behavior.
 //! - Optional uniqueness enforcement on (service, user) via `allow_ambiguity=false`.
 //! - UUID and optional comment attributes exposed via the credential API.
@@ -84,6 +86,11 @@ use regex::Regex;
 use turso::{Builder, Connection, Database, Value};
 use zeroize::Zeroizing;
 
+pub mod rekey;
+#[cfg(target_os = "linux")]
+pub use rekey::rekey_at;
+pub use rekey::{RekeyError, RekeyOutcome, SensitiveKey};
+
 const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // length limits to prevent accidental blow up of db:
@@ -99,38 +106,109 @@ const OPEN_LOCK_RETRIES: u32 = 60;
 const OPEN_LOCK_BACKOFF_MS: u64 = 20;
 const OPEN_LOCK_BACKOFF_MAX_MS: u64 = 250;
 
-/// `EncryptionOpts` mirrors `turso::EncryptionOpts`
+/// `EncryptionOpts` selects the cipher and key for on-disk encryption.
 /// See <https://docs.turso.tech/tursodb/encryption>
 /// Example ciphers: "aegis256", "aes256gcm". For 256-bit keys, hexkey is 64 chars.
-#[derive(Debug, Default, Clone)]
+///
+/// The key is decoded from hex at construction and held in a fixed-size
+/// zeroizing buffer ([`SensitiveKey`]) that is wiped when dropped. The
+/// constructor borrows the caller's hex string; the caller stays responsible
+/// for wiping its own copy.
+#[derive(Clone)]
 pub struct EncryptionOpts {
-    pub cipher: String,
-    pub hexkey: String,
+    cipher: String,
+    key: SensitiveKey,
 }
 
 impl EncryptionOpts {
-    pub fn new(cipher: impl Into<String>, hexkey: impl Into<String>) -> Self {
-        Self {
-            cipher: cipher.into(),
-            hexkey: hexkey.into(),
+    /// Create encryption options from a cipher name and a hex-encoded key.
+    ///
+    /// The key is copied into zeroizing storage; the borrowed `hexkey` is left
+    /// untouched (callers should wipe their own copy, e.g. with `zeroize`).
+    /// Returns an error if the hex is malformed or its length does not match
+    /// the cipher's key size.
+    pub fn new(cipher: &str, hexkey: &str) -> Result<Self> {
+        let key = SensitiveKey::from_hex(hexkey)
+            .map_err(|e| Error::Invalid("hexkey".to_string(), e.to_string()))?;
+        Self::with_key(cipher, key)
+    }
+
+    /// Create encryption options from a cipher name and an already-decoded key.
+    pub fn with_key(cipher: &str, key: SensitiveKey) -> Result<Self> {
+        if cipher.is_empty() {
+            return Err(Error::Invalid(
+                "cipher".to_string(),
+                "cipher must not be empty".to_string(),
+            ));
         }
+        if let Some(expected) = cipher_key_len(cipher)
+            && expected != key.len()
+        {
+            return Err(Error::Invalid(
+                "hexkey".to_string(),
+                format!(
+                    "cipher '{cipher}' requires a {expected}-byte key ({} hex chars)",
+                    expected * 2
+                ),
+            ));
+        }
+        Ok(Self {
+            cipher: cipher.to_string(),
+            key,
+        })
+    }
+
+    /// Cipher name.
+    pub fn cipher(&self) -> &str {
+        &self.cipher
+    }
+
+    /// Borrow the raw key bytes. The bytes remain owned by zeroizing storage.
+    pub fn key_bytes(&self) -> &[u8] {
+        self.key.as_bytes()
+    }
+
+    /// Hex-encode the key into a zeroizing buffer for the turso boundary.
+    pub(crate) fn key_hex(&self) -> Zeroizing<String> {
+        self.key.to_hex()
     }
 }
 
-// EncryptionOpts with zeroizing wrapper for the key. The external interface uses simply String,
-// which we immediately wrap in Zeroizing to ensure it never leaks into the heap. Memory safety
-// for the encryption key is maintained completely in this crate, until it is passed into turso.
-struct EncryptionOptsZero {
-    cipher: String,
-    hexkey: Zeroizing<String>,
+impl fmt::Debug for EncryptionOpts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptionOpts")
+            .field("cipher", &self.cipher)
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
-impl From<EncryptionOpts> for EncryptionOptsZero {
-    fn from(value: EncryptionOpts) -> Self {
-        Self {
-            cipher: value.cipher,
-            hexkey: Zeroizing::new(value.hexkey),
-        }
+/// Key size in bytes for known turso cipher names (dash/underscore aliases
+/// accepted). Unknown ciphers return `None` and are passed through to turso.
+pub(crate) fn cipher_key_len(cipher: &str) -> Option<usize> {
+    let normalized: String = cipher
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| *c != '-' && *c != '_')
+        .collect();
+    match normalized.as_str() {
+        "aegis128l" | "aegis128x2" | "aegis128x4" | "aes128gcm" => Some(16),
+        "aegis256" | "aegis256x2" | "aegis256x4" | "aes256gcm" => Some(32),
+        _ => None,
+    }
+}
+
+/// Build the `turso::EncryptionOpts` handed to the database builder.
+///
+/// NOTE (turso boundary): `turso::EncryptionOpts` stores the key as an
+/// ordinary `String`, which turso frees without wiping. Everything on the
+/// db-keystore side of this call is zeroizing; extending the guarantee into
+/// turso requires a turso API change (out of scope here).
+pub(crate) fn turso_encryption_opts(opts: &EncryptionOpts) -> turso::EncryptionOpts {
+    let hexkey = opts.key_hex();
+    turso::EncryptionOpts {
+        cipher: opts.cipher().to_string(),
+        hexkey: hexkey.as_str().to_string(),
     }
 }
 
@@ -229,8 +307,8 @@ impl DbKeyStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        // convert to zeroized before any possible error return
-        let zero_opts = config.encryption_opts.map(EncryptionOptsZero::from);
+        // move the (zeroizing) key out of the config so it has a single owner
+        let encryption_opts = config.encryption_opts;
         let (store, conn) = if let Some(vfs) = &config.vfs
             && vfs == "memory"
         {
@@ -266,8 +344,8 @@ impl DbKeyStore {
                 Error::Invalid("path".into(), "path must be valid UTF-8".to_string())
             })?;
             ensure_parent_dir(&path)?;
-            let encrypted = zero_opts.as_ref().is_some_and(|o| !o.cipher.is_empty());
-            let db = open_db_with_retry(path_str, zero_opts.as_ref(), config.vfs.as_deref())?;
+            let encrypted = encryption_opts.is_some();
+            let db = open_db_with_retry(path_str, encryption_opts.as_ref(), config.vfs.as_deref())?;
             let conn = retry_turso_locking(|| db.connect())?;
             configure_connection(&conn)?;
             let id = format!(
@@ -311,9 +389,11 @@ impl DbKeyStore {
         let cipher = mods
             .remove("encryption-cipher")
             .or_else(|| mods.remove("cipher"));
+        // keep our copy of the hex key in a zeroizing owner
         let hexkey = mods
             .remove("encryption-hexkey")
-            .or_else(|| mods.remove("hexkey"));
+            .or_else(|| mods.remove("hexkey"))
+            .map(Zeroizing::new);
         let allow_ambiguity = mods
             .remove("allow-ambiguity")
             .or_else(|| mods.remove("allow_ambiguity"))
@@ -325,7 +405,7 @@ impl DbKeyStore {
         let vfs = mods.remove("vfs");
         let encryption_opts = match (cipher, hexkey) {
             (None, None) => None,
-            (Some(cipher), Some(hexkey)) => Some(EncryptionOpts::new(cipher, hexkey)),
+            (Some(cipher), Some(hexkey)) => Some(EncryptionOpts::new(&cipher, hexkey.as_str())?),
             _ => {
                 return Err(Error::Invalid(
                     "encryption".to_string(),
@@ -351,142 +431,6 @@ impl DbKeyStore {
     /// Returns path to database file
     pub fn path(&self) -> String {
         self.inner.path.clone()
-    }
-
-    /// Rekey a keystore out-of-place: read every credential from the source
-    /// database and write it into a freshly created destination database.
-    ///
-    /// This is used to add, remove, or rotate the on-disk encryption key (a DEK
-    /// rotation): pass `dest_opts = Some(..)` to add or rotate encryption, or
-    /// `dest_opts = None` to write an unencrypted copy. `source_opts` must
-    /// supply the cipher/key the source was written with (or `None` if the
-    /// source is unencrypted).
-    ///
-    /// The operation is non-destructive to the source: the source database is
-    /// opened read-only-ish (no rows are mutated) and left fully intact, and the
-    /// destination is fully written before returning. Callers that own a
-    /// verify-then-swap-then-delete sequence (for example secret-vault
-    /// rotate-dek) should treat the returned destination as the new candidate
-    /// and only retire the source after independently verifying it.
-    ///
-    /// Each credential is copied with its `service`, `user`, `uuid`, `comment`,
-    /// and `secret` preserved. Whether the source enforced `(service, user)`
-    /// uniqueness is detected from the source schema and mirrored on the
-    /// destination so ambiguous keystores round-trip unchanged.
-    ///
-    /// `dest_path` must not already exist. Returns a [`RekeyOutcome`] describing
-    /// how many credentials were copied. No secret material is logged or
-    /// included in any returned value.
-    pub fn rekey(
-        source_path: impl AsRef<Path>,
-        source_opts: Option<EncryptionOpts>,
-        dest_path: impl AsRef<Path>,
-        dest_opts: Option<EncryptionOpts>,
-    ) -> Result<RekeyOutcome> {
-        let source_path = source_path.as_ref();
-        let dest_path = dest_path.as_ref();
-
-        if !source_path.is_file() {
-            return Err(Error::NoStorageAccess(Box::new(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no source database at '{}'", source_path.display()),
-            ))));
-        }
-        if dest_path.exists() {
-            return Err(Error::Invalid(
-                "dest_path".to_string(),
-                format!("destination path '{}' already exists", dest_path.display()),
-            ));
-        }
-
-        let source = DbKeyStore::new(DbKeyStoreConfig {
-            path: source_path.to_path_buf(),
-            encryption_opts: source_opts,
-            // open permissively so we can read ambiguous keystores; uniqueness
-            // is detected from the schema below and mirrored on the destination.
-            allow_ambiguity: true,
-            ..Default::default()
-        })?;
-
-        let allow_ambiguity = source.detect_allow_ambiguity()?;
-
-        let dest = DbKeyStore::new(DbKeyStoreConfig {
-            path: dest_path.to_path_buf(),
-            encryption_opts: dest_opts,
-            allow_ambiguity,
-            ..Default::default()
-        })?;
-
-        let entries = source.read_all_for_rekey()?;
-        let copied = entries.len();
-        for entry in &entries {
-            dest.write_for_rekey(entry)?;
-        }
-
-        Ok(RekeyOutcome { copied })
-    }
-
-    /// Detect whether the source schema enforces `(service, user)` uniqueness.
-    /// Returns `true` if ambiguous entries are permitted (no unique constraint).
-    fn detect_allow_ambiguity(&self) -> Result<bool> {
-        let conn = self.inner.connect()?;
-        let has_unique = map_turso(block_on(schema_has_unique_service_user(&conn)))?;
-        Ok(!has_unique)
-    }
-
-    /// Read every credential (including secret) for an out-of-place rekey copy.
-    fn read_all_for_rekey(&self) -> Result<Vec<RekeyRecord>> {
-        let conn = self.inner.connect()?;
-        map_turso(block_on(query_all_for_rekey(&conn)))
-    }
-
-    /// Insert one credential into this (destination) store, preserving its
-    /// service, user, uuid, comment, and secret.
-    fn write_for_rekey(&self, record: &RekeyRecord) -> Result<()> {
-        validate_service_user(&record.service, &record.user)?;
-        validate_secret(&record.secret)?;
-        let credential = DbKeyCredential {
-            inner: Arc::clone(&self.inner),
-            id: CredId {
-                service: record.service.clone(),
-                user: record.user.clone(),
-            },
-            uuid: Some(normalize_uuid_input(&record.uuid)?),
-            comment: record.comment.clone(),
-        };
-        credential.set_secret(record.secret.as_slice())
-    }
-}
-
-/// Result of a [`DbKeyStore::rekey`] operation.
-///
-/// Intentionally carries no secret material so it is safe to log or format.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct RekeyOutcome {
-    /// Number of credentials copied from source to destination.
-    pub copied: usize,
-}
-
-/// One credential read from the source during rekey. The `secret` is held in a
-/// `Zeroizing` buffer so it is wiped from the heap when the record is dropped.
-struct RekeyRecord {
-    service: String,
-    user: String,
-    uuid: String,
-    comment: Option<String>,
-    secret: Zeroizing<Vec<u8>>,
-}
-
-impl fmt::Debug for RekeyRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // never expose the secret in Debug output
-        f.debug_struct("RekeyRecord")
-            .field("service", &self.service)
-            .field("user", &self.user)
-            .field("uuid", &self.uuid)
-            .field("comment", &self.comment)
-            .field("secret", &"<redacted>")
-            .finish()
     }
 }
 
@@ -1140,32 +1084,6 @@ async fn query_all_credentials(
     Ok(results)
 }
 
-/// Read every credential, including its secret, for an out-of-place rekey copy.
-async fn query_all_for_rekey(conn: &Connection) -> turso::Result<Vec<RekeyRecord>> {
-    let mut rows = conn
-        .query(
-            "SELECT service, user, uuid, secret, comment FROM credentials",
-            (),
-        )
-        .await?;
-    let mut results = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let service = value_to_string(row.get_value(0)?, "service")?;
-        let user = value_to_string(row.get_value(1)?, "user")?;
-        let uuid = value_to_string(row.get_value(2)?, "uuid")?;
-        let secret = value_to_secret(row.get_value(3)?, "secret")?;
-        let comment = value_to_option_string(row.get_value(4)?, "comment")?;
-        results.push(RekeyRecord {
-            service,
-            user,
-            uuid,
-            comment,
-            secret,
-        });
-    }
-    Ok(results)
-}
-
 /// Returns true if the `credentials` schema enforces `(service, user)`
 /// uniqueness, either via a unique index or a table-level unique constraint.
 async fn schema_has_unique_service_user(conn: &Connection) -> turso::Result<bool> {
@@ -1385,22 +1303,18 @@ fn configure_connection(conn: &Connection) -> Result<()> {
 /// Opens database. Retries with exponential backoff if the file is locked.
 fn open_db_with_retry(
     path_str: &str,
-    encryption_opts: Option<&EncryptionOptsZero>,
+    encryption_opts: Option<&EncryptionOpts>,
     vfs: Option<&str>,
 ) -> Result<Database> {
     let mut retries = OPEN_LOCK_RETRIES;
     let mut backoff_ms = OPEN_LOCK_BACKOFF_MS;
     loop {
         let mut builder = Builder::new_local(path_str);
-        if let Some(opts) = &encryption_opts {
-            let turso_enc_opts = turso::EncryptionOpts {
-                cipher: opts.cipher.clone(),
-                // send not-zeroized key to turso each retry iteration
-                hexkey: opts.hexkey.to_string(),
-            };
+        if let Some(opts) = encryption_opts {
+            // key stays zeroizing on our side; see turso_encryption_opts for the boundary note
             builder = builder
                 .experimental_encryption(true)
-                .with_encryption(turso_enc_opts);
+                .with_encryption(turso_encryption_opts(opts));
         }
         if let Some(vfs) = vfs {
             builder = builder.with_io(vfs.to_string());
@@ -1537,7 +1451,12 @@ fn validate_service_user(service: &str, user: &str) -> Result<()> {
 
 /// confirm secret is within length bounds
 fn validate_secret(secret: &[u8]) -> Result<()> {
-    if secret.len() > MAX_SECRET_LEN as usize {
+    validate_secret_len(secret.len())
+}
+
+/// confirm secret length is within bounds (without needing the bytes)
+fn validate_secret_len(len: usize) -> Result<()> {
+    if len > MAX_SECRET_LEN as usize {
         return Err(Error::TooLong("secret".to_string(), MAX_SECRET_LEN));
     }
     Ok(())
@@ -1988,7 +1907,7 @@ mod tests {
             encryption_opts: Some(EncryptionOpts::new(
                 "aes256gcm",
                 "0000000011111111222222223333333344444444555555556666666677777777",
-            )),
+            )?),
             ..Default::default()
         };
         let store = DbKeyStore::new(config)?;

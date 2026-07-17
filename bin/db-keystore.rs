@@ -231,13 +231,20 @@ fn cmd_rekey(
 
     let source_opts = cipher_opts
         .as_ref()
-        .map(|(cipher, hexkey)| EncryptionOpts::new(cipher.clone(), hexkey.as_str().to_string()));
+        .map(|(cipher, hexkey)| EncryptionOpts::new(cipher, hexkey.as_str()))
+        .transpose()?;
     let dest_opts = new_cipher_opts
         .as_ref()
-        .map(|(cipher, hexkey)| EncryptionOpts::new(cipher.clone(), hexkey.as_str().to_string()));
+        .map(|(cipher, hexkey)| EncryptionOpts::new(cipher, hexkey.as_str()))
+        .transpose()?;
 
-    let outcome = DbKeyStore::rekey(&resolved_path, source_opts, &args.output, dest_opts)
-        .context("rekey failed")?;
+    let outcome = DbKeyStore::rekey(
+        &resolved_path,
+        source_opts.as_ref(),
+        &args.output,
+        dest_opts.as_ref(),
+    )
+    .context("rekey failed")?;
     eprintln!(
         "rekeyed {} credential(s) to '{}'",
         outcome.copied,
