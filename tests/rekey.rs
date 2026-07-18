@@ -67,7 +67,7 @@ fn assert_mode_0600(path: &Path) {
 // Acceptance: rotate-dek N -> N+1. Every credential decrypts under the new
 // key and matches the source; the source remains readable under the old key;
 // the destination is cleanly closed (no WAL/SHM), mode 0600; the wrong
-// destination key fails closed with an error, not a panic.
+// destination key fails closed with an error and never panics.
 #[test]
 fn rekey_rotates_dek_out_of_place() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -462,8 +462,8 @@ fn success_returns_closed_durable_candidate() {
 }
 
 // Descriptor-relative rekey: dir-fd + name API works and survives the parent
-// directory being renamed mid-operation setup (the descriptor, not the path,
-// is authoritative).
+// directory being renamed mid-operation setup (the descriptor stays
+// authoritative after the path changes).
 #[cfg(target_os = "linux")]
 #[test]
 fn rekey_at_descriptor_relative() {
@@ -494,7 +494,7 @@ fn rekey_at_descriptor_relative() {
     let moved_dst_dir = dir.path().join("dstdir-moved");
     std::fs::rename(&dst_dir_path, &moved_dst_dir).expect("rename dst dir");
 
-    let outcome = db_keystore::rekey_at(
+    let (outcome, dest_fd) = db_keystore::rekey_at(
         &src_dir,
         "src.db",
         Some(&enc_opts(HEXKEY_256)),
@@ -508,6 +508,19 @@ fn rekey_at_descriptor_relative() {
     // the destination landed in the pinned (renamed) directory
     let dst = moved_dst_dir.join("dst.db");
     assert!(dst.is_file(), "destination created in pinned directory");
+
+    // the returned fd is the created destination file itself (custody
+    // extends past the call: same dev/ino as the directory entry)
+    {
+        use std::os::unix::fs::MetadataExt;
+        let fd_meta = std::fs::File::from(dest_fd).metadata().expect("fd meta");
+        let entry_meta = dst.metadata().expect("entry meta");
+        assert_eq!(
+            (fd_meta.dev(), fd_meta.ino()),
+            (entry_meta.dev(), entry_meta.ino()),
+            "returned fd must refer to the created destination inode"
+        );
+    }
     assert_mode_0600(&dst);
     assert_no_sidecars(&dst);
     let store = open_encrypted(&dst, HEXKEY_256_B);
@@ -536,8 +549,8 @@ fn rekey_at_rejects_path_components() {
     );
 }
 
-// Regression: rows that a normalizing copy would rewrite — uppercase uuid,
-// empty-string comment, TEXT-storage-class secret — must be copied byte- and
+// Regression: rows that a normalizing copy would rewrite (uppercase uuid,
+// empty-string comment, TEXT-storage-class secret) must be copied byte- and
 // storage-class-exact and verify successfully.
 #[test]
 fn preserves_unusual_rows_byte_exact() {
@@ -655,6 +668,194 @@ fn unsupported_schema_version_is_rejected() {
         "unexpected error: {err:?}"
     );
     assert!(!dst.exists(), "destination cleaned up");
+}
+
+// Standalone verification (B1): a faithfully rekeyed candidate verifies with
+// the correct count; corrupting one destination secret afterwards is
+// detected; a wrong destination key is a typed WrongDestinationKey (reachable
+// now that verification re-opens an existing destination); a missing
+// destination is DestinationNotFound; and verifying a cleanly-closed
+// candidate leaves it cleanly closed (no sidecar files remain).
+#[test]
+fn verify_reverifies_candidate_and_detects_divergence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src.db");
+    let dst = dir.path().join("dst.db");
+    {
+        let store = open_plain(&src);
+        for (user, pw) in [("alice", "pw-a"), ("bob", "pw-b")] {
+            let entry = store.build("svc", user, None).expect("build");
+            entry.set_password(pw).expect("set");
+        }
+    }
+    DbKeyStore::rekey(&src, None, &dst, Some(&enc_opts(HEXKEY_256))).expect("rekey");
+
+    // the candidate re-verifies after rekey has returned
+    let verified = DbKeyStore::verify(&src, None, &dst, Some(&enc_opts(HEXKEY_256)))
+        .expect("verify rekeyed candidate");
+    assert_eq!(verified, 2, "all records verified");
+    // verification must leave the cleanly-closed candidate cleanly closed
+    assert_no_sidecars(&dst);
+
+    // verification is repeatable (sidecar hygiene left nothing behind that
+    // would change a second run)
+    let verified =
+        DbKeyStore::verify(&src, None, &dst, Some(&enc_opts(HEXKEY_256))).expect("verify again");
+    assert_eq!(verified, 2);
+
+    // wrong destination key: typed error, no panic
+    let err = DbKeyStore::verify(&src, None, &dst, Some(&enc_opts(HEXKEY_256_WRONG)))
+        .expect_err("wrong destination key must fail");
+    assert!(
+        matches!(err, RekeyError::WrongDestinationKey),
+        "unexpected error: {err:?}"
+    );
+
+    // corrupt one destination secret without changing the row count
+    {
+        let db = block_on(
+            turso::Builder::new_local(dst.to_str().unwrap())
+                .experimental_encryption(true)
+                .with_encryption(turso::EncryptionOpts {
+                    cipher: "aes256gcm".to_string(),
+                    hexkey: HEXKEY_256.to_string(),
+                })
+                .build(),
+        )
+        .expect("open dst raw");
+        let conn = db.connect().expect("conn");
+        let changed = block_on(conn.execute(
+            "UPDATE credentials SET secret = X'DEADBEEF' WHERE user = 'bob'",
+            (),
+        ))
+        .expect("corrupt");
+        assert_eq!(changed, 1);
+    }
+    let err = DbKeyStore::verify(&src, None, &dst, Some(&enc_opts(HEXKEY_256)))
+        .expect_err("must detect corrupted secret");
+    assert!(
+        matches!(err, RekeyError::VerificationMismatch(_)),
+        "unexpected error: {err:?}"
+    );
+
+    // missing destination: typed error, nothing created
+    let missing = dir.path().join("nope.db");
+    let err =
+        DbKeyStore::verify(&src, None, &missing, None).expect_err("missing destination must fail");
+    assert!(
+        matches!(err, RekeyError::DestinationNotFound(_)),
+        "unexpected error: {err:?}"
+    );
+    assert!(!missing.exists(), "verify must not create the destination");
+}
+
+// verify() must not disturb a source whose credentials still live in an
+// uncheckpointed WAL: the pre-existing WAL is read, never removed.
+#[test]
+fn verify_leaves_preexisting_source_wal_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src.db");
+    let dst = dir.path().join("dst.db");
+    let wal = src.with_file_name("src.db-wal");
+    {
+        let store = open_plain(&src);
+        let entry = store.build("svc", "user", None).expect("build");
+        entry.set_password("pw").expect("set");
+    }
+    assert!(
+        wal.metadata().map(|m| m.len() > 0).unwrap_or(false),
+        "test setup: source WAL should contain uncheckpointed frames"
+    );
+    DbKeyStore::rekey(&src, None, &dst, None).expect("rekey");
+
+    let verified = DbKeyStore::verify(&src, None, &dst, None).expect("verify");
+    assert_eq!(verified, 1);
+    assert!(
+        wal.metadata().map(|m| m.len() > 0).unwrap_or(false),
+        "pre-existing source WAL must survive verification untouched"
+    );
+}
+
+// Descriptor-relative verification (B1, Linux): verify_at re-verifies a
+// candidate produced by rekey_at inside pinned directories, and detects
+// divergence the same way.
+#[cfg(target_os = "linux")]
+#[test]
+fn verify_at_descriptor_relative() {
+    use std::os::fd::OwnedFd;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src.db");
+    {
+        let store = open_plain(&src);
+        for (user, pw) in [("alice", "pw-a"), ("bob", "pw-b")] {
+            let entry = store.build("svc", user, None).expect("build");
+            entry.set_password(pw).expect("set");
+        }
+    }
+    let dir_fd: OwnedFd = std::fs::File::open(dir.path()).expect("open dir").into();
+
+    let (outcome, _dest_fd) = db_keystore::rekey_at(
+        &dir_fd,
+        "src.db",
+        None,
+        &dir_fd,
+        "dst.db",
+        Some(&enc_opts(HEXKEY_256)),
+    )
+    .expect("rekey_at");
+    assert_eq!(outcome.copied, 2);
+
+    let verified = db_keystore::verify_at(
+        &dir_fd,
+        "src.db",
+        None,
+        &dir_fd,
+        "dst.db",
+        Some(&enc_opts(HEXKEY_256)),
+    )
+    .expect("verify_at");
+    assert_eq!(verified, 2);
+    // the candidate stays cleanly closed
+    assert_no_sidecars(&dir.path().join("dst.db"));
+
+    // a missing name is typed
+    let err = db_keystore::verify_at(&dir_fd, "src.db", None, &dir_fd, "nope.db", None)
+        .expect_err("missing destination must fail");
+    assert!(
+        matches!(err, RekeyError::DestinationNotFound(_)),
+        "unexpected error: {err:?}"
+    );
+
+    // divergence is detected: remove a destination record via a raw handle
+    {
+        let dst = dir.path().join("dst.db");
+        let db = block_on(
+            turso::Builder::new_local(dst.to_str().unwrap())
+                .experimental_encryption(true)
+                .with_encryption(turso::EncryptionOpts {
+                    cipher: "aes256gcm".to_string(),
+                    hexkey: HEXKEY_256.to_string(),
+                })
+                .build(),
+        )
+        .expect("open dst raw");
+        let conn = db.connect().expect("conn");
+        block_on(conn.execute("DELETE FROM credentials WHERE user = 'bob'", ())).expect("delete");
+    }
+    let err = db_keystore::verify_at(
+        &dir_fd,
+        "src.db",
+        None,
+        &dir_fd,
+        "dst.db",
+        Some(&enc_opts(HEXKEY_256)),
+    )
+    .expect_err("must detect missing record");
+    assert!(
+        matches!(err, RekeyError::VerificationMismatch(_)),
+        "unexpected error: {err:?}"
+    );
 }
 
 // Missing destination parent directories are created (as in 0.4.x).

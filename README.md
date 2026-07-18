@@ -123,7 +123,7 @@ fn search(
 
 ## Changing database settings
 
-If you decide to change the database configuration after the database has been created, a bit of maintenance with the `db-keystore` maintenance tool is required.
+To change the database configuration after the database has been created, use the `db-keystore` maintenance tool.
 
 ### Changing encryption
 
@@ -131,7 +131,7 @@ To change database encryption (adding encryption, removing encryption, rotating 
 
 ### Changing allow_ambiguous from false to true
 
-To change a database to allow ambiguous entries, Use `db-keystore allow-ambiguous` to remove the unique index. Then the db can be opened with `DbKeyStoreConfig::allow_ambiguous: true`.
+To change a database to allow ambiguous entries, use `db-keystore allow-ambiguous` to remove the unique index. Then the db can be opened with `DbKeyStoreConfig::allow_ambiguous: true`.
 
 ### Changing allow_ambiguous from true to false
 
@@ -215,7 +215,7 @@ secrets being accidentally logged or leaking into heap, however we can only foll
 on our side of the turso API boundary. turso uses ordinary `String` for the db encryption key
 and `Vec<u8>` for returning encrypted data, so secrets can leak into the heap when these objects
 are freed. In addition, turso may cache unencrypted pages in memory. To prevent unencrypted secrets
-from being swapped to disk, it is strongly recommended to disable swap for the process, disable
+from being swapped to disk, we strongly recommend disabling swap for the process, disabling
 swap for the system, and using an encrypted disk partition.
 
 - **Keep the unit out of swap.** For systemd services, add `MemorySwapMax=0` to the `[Service]`
@@ -229,9 +229,10 @@ swap for the system, and using an encrypted disk partition.
 - **Disable core dumps for the unit.** A crash dump of the process contains its heap, with cache
   pages. Set `LimitCORE=0` in the unit and, where `systemd-coredump` is active, set
   `Storage=none` in `coredump.conf` (or mask the socket) so nothing writes the heap to disk.
-- **Use drive encryption**. If you do all of the above you've kept the system from writing
-  secrets to disk, except for hibernation. A hibernation image contains all of RAM, even locked pages.
-  You want to ensure the hibernation image is encrypted at rest.
+- **Use drive encryption**. If you do all of the above you've kept the system from writing secrets
+  from memory to disk, except for hibernation. A hibernation image contains all of RAM, even locked pages.
+  Using full drive encryption is usually recommended anyway, but if your system has hibernation enabled,
+  the drive, or at least the hibernation image file, needs to be encrypted so secrets are encrypted at rest.
 
 ## Release Notes
 

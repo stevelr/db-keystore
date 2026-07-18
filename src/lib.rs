@@ -8,7 +8,8 @@
 //! Features:
 //! - Local sqlite storage with optional encryption options.
 //! - Verified out-of-place rekey (DEK rotation) with safe destination
-//!   creation and typed errors: see the [`rekey`] module.
+//!   creation and typed errors, plus standalone verification of two existing
+//!   keystores ([`DbKeyStore::verify`]): see the [`rekey`] module.
 //! - WAL + busy timeout for better multi-process behavior.
 //! - Optional uniqueness enforcement on (service, user) via `allow_ambiguity=false`.
 //! - UUID and optional comment attributes exposed via the credential API.
@@ -87,9 +88,9 @@ use turso::{Builder, Connection, Database, Value};
 use zeroize::Zeroizing;
 
 pub mod rekey;
-#[cfg(target_os = "linux")]
-pub use rekey::rekey_at;
 pub use rekey::{RekeyError, RekeyOutcome, SensitiveKey};
+#[cfg(target_os = "linux")]
+pub use rekey::{rekey_at, verify_at};
 
 const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 

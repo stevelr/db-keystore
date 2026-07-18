@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## 0.5.0-pre.2
+
+**Added**
+
+- `DbKeyStore::verify` (and descriptor-relative `verify_at` on Linux):
+  standalone verification of two existing keystores using the same streaming,
+  byte- and storage-class-exact record comparison rekey runs internally.
+  Returns the verified record count; copies and modifies nothing (sidecar
+  files created as a side effect of the database-layer open are removed if
+  still empty; pre-existing sidecars are never touched). Makes
+  `RekeyError::WrongDestinationKey` reachable, and adds typed
+  `DestinationNotFound`, `CorruptDestination`, and `DestinationReplaced`
+  variants for destination-side conditions verification can encounter.
+- `tests/sidecar_pin.rs`: pins the turso version together with the WAL/SHM
+  sidecar suffix set (`{-wal, -tshm}`, now a single `SIDECAR_SUFFIXES`
+  constant used by pre-creation, cleanup, and verification), so a turso bump
+  fails CI until the set is re-verified against the new turso. A second,
+  empirical test asserts every sidecar the database layer actually creates is
+  covered by the pinned set.
+
+**Changed**
+
+- **Breaking** `rekey_at` now returns `(RekeyOutcome, OwnedFd)`: the second
+  element is the descriptor of the created destination file, so the
+  pinned-inode chain of custody extends past the call and a subsequent
+  `renameat`-style swap can re-check the directory entry against it instead
+  of re-resolving by name. It also now accepts `impl AsFd` directory handles
+  instead of `&OwnedFd`.
+- `RekeyError::Panicked` payloads are bounded (256 chars) and stripped of
+  control characters at capture time; the payload is documented as
+  best-effort diagnostic text with no stable format.
+- Documentation: the path-based `DbKeyStore::rekey` rustdoc now steers
+  security-sensitive callers to `rekey_at` (the path API `create_dir_all`s
+  missing destination parents with umask-default modes and follows source
+  symlinks); the module docs state that `catch_unwind` panic containment
+  presumes `panic = "unwind"`, that quiescence is the caller's job
+  (concurrent source writers are only caught fail-closed at verification),
+  and describe the internal blocking executor and its
+  lock-retry/backoff ceiling (60 retries, capped at 250 ms).
+
 ## 0.5.0-pre.1
 
 Pre-release for integration testing.
@@ -55,14 +95,14 @@ Pre-release for integration testing.
   destination, sidecars) is re-checked against the inode validated or created
   at the start; a final-component swap in the window before turso's by-path
   open is thereby detected (turso cannot yet open an already-created
-  descriptor, so it cannot be prevented outright — see module docs).
+  descriptor, so it cannot be prevented outright; see module docs).
 - Exact rekey verification: `DbKeyStore::rekey` does not return success until
   every record (`service`, `user`, `uuid`, `comment`, and secret bytes) has
   been compared between source and destination, streaming one record at a
-  time (bounded memory). Records are copied byte- and storage-class-exact —
-  no case-folding, comment normalization, or type coercion — so verification
+  time (bounded memory). Records are copied byte- and storage-class-exact
+  (no case-folding, comment normalization, or type coercion), so verification
   compares raw values for strict equality. A matching row count alone is
-  never accepted, and there is no `verified` flag to ignore — success means
+  never accepted, and there is no separate `verified` flag: success means
   verified. No digest of secrets (keyed or otherwise) is computed, persisted,
   or returned.
 - Durable close: before returning success the destination WAL is checkpointed

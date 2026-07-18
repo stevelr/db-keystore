@@ -19,9 +19,9 @@
 //!   (source, destination, and sidecars) re-verified to still be the inode
 //!   that was validated or created at the start.
 //!
-//! Substitution resistance has one caveat: turso opens files by path, not by
-//! descriptor, so a swap of the *final* path component in the window between
-//! creation/validation and turso's own open cannot be prevented — only
+//! Substitution resistance has one caveat: turso opens files only by path,
+//! so a swap of the *final* path component in the window between
+//! creation/validation and turso's own open cannot be prevented, only
 //! detected. The inode re-verification above closes that window after the
 //! fact: a swapped source, destination, or sidecar entry causes an error
 //! ([`RekeyError::SourceReplaced`] / [`RekeyError::UnsafeDestination`])
@@ -30,7 +30,7 @@
 //! currently support (see todo notes; out of scope here).
 //!
 //! On failure a typed [`RekeyError`] is returned without panicking, the source
-//! is left unchanged, and partially written destination files are removed —
+//! is left unchanged, and partially written destination files are removed,
 //! but only files whose directory entries still match the inodes this
 //! operation created; pre-existing or substituted files are never deleted.
 //!
@@ -39,13 +39,34 @@
 //! parameter blobs as ordinary `Vec<u8>`/`String` and the encryption key as
 //! an ordinary `String`, all freed without wiping. During the copy, each
 //! secret travels only inside the `turso::Value` read from the source row and
-//! bound directly to the destination insert — both turso-owned allocations;
+//! bound directly to the destination insert, both turso-owned allocations;
 //! this module adds no copies of its own. Extending zeroization into turso
 //! requires a turso API change and is out of scope here.
 //!
 //! No digest of credential secrets (keyed or not) is exposed by this API;
 //! comparison is exact and internal, so low-entropy secrets cannot be attacked
-//! offline through the verification machinery.
+//! offline through the verification machinery. The same streaming comparison
+//! is available on its own, without copying anything, as
+//! [`DbKeyStore::verify`] (and, descriptor-relative on Linux, `verify_at`),
+//! for re-verifying a rekeyed candidate or comparing two existing keystores.
+//!
+//! # Caller obligations and runtime notes
+//!
+//! - **Quiescence is the caller's job.** Rekey and verify do not lock out
+//!   concurrent writers. A source mutated mid-operation is caught fail-closed
+//!   by the exact verification ([`RekeyError::VerificationMismatch`]);
+//!   serialize these operations against your own writers and treat the
+//!   fail-closed error as only a backstop.
+//! - **Panic containment presumes `panic = "unwind"`.** The `catch_unwind`
+//!   conversion to [`RekeyError::Panicked`] cannot run in a binary built with
+//!   `panic = "abort"`; in that profile a database-layer panic aborts the
+//!   process instead of returning an error.
+//! - **Synchronous API, internal executor.** These functions drive turso's
+//!   async API to completion with a blocking executor on the calling thread,
+//!   and transient file-lock errors are retried internally (up to 60 retries
+//!   with exponential backoff from 20 ms capped at 250 ms; worst case
+//!   roughly 15 seconds per database open or connect). Plan timeouts
+//!   accordingly; there is no async variant.
 
 use std::{
     fmt,
@@ -69,13 +90,27 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
+/// The sidecar files turso 0.7 creates next to a database file.
+///
+/// This is the single source of truth for the suffix set: destination
+/// pre-creation (mode `0600`), failure cleanup, post-rekey re-verification,
+/// and verify's sidecar hygiene all iterate this list. Verified against turso
+/// 0.7.0 (`coordination_path_for_wal_path`); `tests/sidecar_pin.rs` pins the
+/// turso version together with this set so a dependency bump fails CI until
+/// the set is re-verified.
+const SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-tshm"];
+
+/// The WAL member of [`SIDECAR_SUFFIXES`], singled out for the
+/// checkpoint-leaves-empty-WAL assertion.
+const WAL_SUFFIX: &str = "-wal";
+
 /// Result of a successful [`DbKeyStore::rekey`] operation.
 ///
 /// Success itself means "exactly verified": rekey does not return this value
 /// until every source record has been compared byte-for-byte against the
 /// destination and the destination has been durably closed.
 ///
-/// Intentionally carries no secret material so it is safe to log or format.
+/// Contains no secret material, so it is safe to log or format.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RekeyOutcome {
     /// Number of credentials copied (and verified) from source to destination.
@@ -94,9 +129,9 @@ pub enum RekeyError {
     /// The source database could not be decrypted with the supplied key/cipher.
     WrongSourceKey,
     /// The destination database could not be decrypted with the supplied
-    /// key/cipher. (Not currently produced by rekey itself, which always
-    /// creates a fresh destination; reserved for flows that re-open a
-    /// destination candidate.)
+    /// key/cipher. Produced by [`DbKeyStore::verify`] (and `verify_at`),
+    /// which re-open an existing destination candidate; rekey itself always
+    /// creates a fresh destination and cannot produce this.
     WrongDestinationKey,
     /// The source directory entry stopped referring to the file that was
     /// validated at the start of the operation (it was replaced mid-rekey).
@@ -112,6 +147,19 @@ pub enum RekeyError {
     VerificationMismatch(String),
     /// The destination path already exists (including as a symlink).
     DestinationExists(String),
+    /// The destination database does not exist or is not a regular file.
+    /// Produced only by verification, which requires an existing destination
+    /// (rekey requires the opposite; see [`RekeyError::DestinationExists`]).
+    DestinationNotFound(String),
+    /// The destination is not a readable db-keystore database (corrupt, not a
+    /// database, or missing the credentials table). Produced only by
+    /// verification; rekey always creates its destination.
+    CorruptDestination(String),
+    /// The destination directory entry stopped referring to the file that was
+    /// validated at the start of a verification (it was replaced mid-verify).
+    /// The rekey entry points report the same condition as
+    /// [`RekeyError::UnsafeDestination`].
+    DestinationReplaced(String),
     /// The destination could not be created safely, or the directory entry no
     /// longer refers to the file that was created.
     UnsafeDestination(String),
@@ -122,6 +170,10 @@ pub enum RekeyError {
     /// Other database-layer error.
     Database(String),
     /// A panic escaped the database layer and was converted into an error.
+    ///
+    /// The payload is best-effort diagnostic text with no stable format: it
+    /// is captured from whatever code panicked, length-bounded, and stripped
+    /// of control characters at capture time. Do not parse it.
     Panicked(String),
 }
 
@@ -148,6 +200,18 @@ impl fmt::Display for RekeyError {
             }
             RekeyError::DestinationExists(msg) => {
                 write!(f, "destination already exists: {msg}")
+            }
+            RekeyError::DestinationNotFound(msg) => {
+                write!(f, "destination database not found: {msg}")
+            }
+            RekeyError::CorruptDestination(msg) => {
+                write!(f, "destination is not a usable database: {msg}")
+            }
+            RekeyError::DestinationReplaced(msg) => {
+                write!(
+                    f,
+                    "destination file was replaced during verification: {msg}"
+                )
             }
             RekeyError::UnsafeDestination(msg) => {
                 write!(f, "destination could not be created safely: {msg}")
@@ -183,7 +247,7 @@ impl From<std::io::Error> for RekeyError {
 /// bytes live in a `Zeroizing<[u8; 32]>` that is wiped on drop; no ordinary
 /// heap copy of the key is made by this type. Constructors borrow the caller's
 /// buffer, so the caller keeps ownership (and wiping responsibility) of its
-/// own copy — no particular zeroizing library is required of callers.
+/// own copy. No particular zeroizing library is required of callers.
 #[derive(Clone)]
 pub struct SensitiveKey {
     bytes: Zeroizing<[u8; 32]>,
@@ -291,6 +355,9 @@ fn db_err(err: &turso::Error, side: Side) -> RekeyError {
         (turso::Error::NotAdb(_) | turso::Error::Corrupt(_), Side::Source) => {
             RekeyError::CorruptSource(text)
         }
+        (turso::Error::NotAdb(_) | turso::Error::Corrupt(_), Side::Destination) => {
+            RekeyError::CorruptDestination(text)
+        }
         _ => RekeyError::Database(text),
     }
 }
@@ -333,6 +400,19 @@ impl DbKeyStore {
     /// [module docs](self) for the substitution-resistance caveat shared by
     /// both entry points.
     ///
+    /// # Choosing an entry point
+    ///
+    /// Security-sensitive callers on Linux should prefer [`rekey_at`]. This
+    /// path-based entry point creates missing destination parent directories
+    /// with `create_dir_all` (umask-default modes) and follows
+    /// symlinks when canonicalizing the source path; `rekey_at` does neither,
+    /// pins both directories by descriptor for the whole operation, and
+    /// returns the created destination's file descriptor so custody extends
+    /// through the caller's subsequent swap.
+    ///
+    /// See the [module docs](self) for caller obligations: quiescence,
+    /// `panic = "unwind"`, and the internal executor/retry behavior.
+    ///
     /// No secret material is logged or included in any returned value.
     pub fn rekey(
         source_path: impl AsRef<Path>,
@@ -343,6 +423,46 @@ impl DbKeyStore {
         let source_path = source_path.as_ref();
         let dest_path = dest_path.as_ref();
         catch_panics(|| rekey_paths(source_path, source_opts, dest_path, dest_opts))
+    }
+
+    /// Verify that two existing keystores contain exactly equal credential
+    /// records, without copying or modifying anything.
+    ///
+    /// This is the same streaming comparison [`DbKeyStore::rekey`] runs
+    /// before returning success: every record's `service`, `user`, `uuid`,
+    /// `comment`, and secret bytes compared byte- and storage-class-exact,
+    /// one record at a time (bounded memory), with no digest of secrets
+    /// computed and no secret material in any error. Returns the number of
+    /// records verified; any divergence (differing field, missing record,
+    /// extra record) is a [`RekeyError::VerificationMismatch`].
+    ///
+    /// Use it to re-verify a rekeyed candidate before or after an
+    /// atomic-rename swap, or to compare any two keystores. Unlike `rekey`,
+    /// both databases must already exist ([`RekeyError::SourceNotFound`] /
+    /// [`RekeyError::DestinationNotFound`] otherwise); nothing is created and
+    /// no schema is initialized or written on either side. A destination that
+    /// cannot be decrypted with `dest_opts` returns
+    /// [`RekeyError::WrongDestinationKey`]; a destination that is not a
+    /// keystore database returns [`RekeyError::CorruptDestination`].
+    ///
+    /// One side effect is unavoidable at the database layer: opening a
+    /// database creates an empty WAL sidecar if none exists. Sidecar files
+    /// that this verification's own open created, and that are still empty,
+    /// are removed before returning; pre-existing sidecar files are never
+    /// touched (a source with uncheckpointed WAL frames verifies fine and
+    /// keeps its WAL).
+    ///
+    /// As with rekey, quiescence is the caller's job; see the
+    /// [module docs](self).
+    pub fn verify(
+        source_path: impl AsRef<Path>,
+        source_opts: Option<&EncryptionOpts>,
+        dest_path: impl AsRef<Path>,
+        dest_opts: Option<&EncryptionOpts>,
+    ) -> Result<u64, RekeyError> {
+        let source_path = source_path.as_ref();
+        let dest_path = dest_path.as_ref();
+        catch_panics(|| verify_paths(source_path, source_opts, dest_path, dest_opts))
     }
 }
 
@@ -361,35 +481,83 @@ impl DbKeyStore {
 /// - the databases are opened through `/proc/self/fd/<dirfd>/<name>`, so every
 ///   file turso touches (including WAL sidecars) resolves through the pinned
 ///   directory descriptors;
-/// - before success, every directory entry — source, destination, and
-///   sidecars — is re-checked (`O_NOFOLLOW`) to confirm it is still the inode
+/// - before success, every directory entry (source, destination, and
+///   sidecars) is re-checked (`O_NOFOLLOW`) to confirm it is still the inode
 ///   validated or created at the start; otherwise
 ///   [`RekeyError::SourceReplaced`] or [`RekeyError::UnsafeDestination`] is
-///   returned. As the [module docs](self) explain, a final-component swap in
-///   the window before turso's own by-path open is detected by these checks
-///   rather than prevented; the directory itself can never be substituted.
+///   returned. As the [module docs](self) explain, these checks detect a
+///   final-component swap in the window before turso's own by-path open but
+///   cannot prevent it; the directory itself can never be substituted.
 ///
 /// `source_name` and `dest_name` must be single path components (no `/`).
 /// Directory descriptors should be opened with read access (`O_RDONLY |
 /// O_DIRECTORY`) so the destination directory can be fsynced.
+///
+/// On success, returns the [`RekeyOutcome`] together with the `OwnedFd` of
+/// the created destination file. The descriptor is the same one the
+/// destination was created and verified through, so the pinned-inode chain
+/// of custody extends past this call: a caller performing its own
+/// `renameat`-style swap can re-check the directory entry against this
+/// descriptor (`fstat` dev/ino) instead of re-resolving by name. Dropping it
+/// is harmless: the destination is already durably closed.
+///
+/// See the [module docs](self) for caller obligations: quiescence,
+/// `panic = "unwind"`, and the internal executor/retry behavior.
 #[cfg(target_os = "linux")]
 pub fn rekey_at(
-    source_dir: &OwnedFd,
+    source_dir: impl AsFd,
     source_name: &str,
     source_opts: Option<&EncryptionOpts>,
-    dest_dir: &OwnedFd,
+    dest_dir: impl AsFd,
     dest_name: &str,
     dest_opts: Option<&EncryptionOpts>,
-) -> Result<RekeyOutcome, RekeyError> {
+) -> Result<(RekeyOutcome, OwnedFd), RekeyError> {
+    let source_dir = source_dir.as_fd();
+    let dest_dir = dest_dir.as_fd();
     catch_panics(|| {
         rekey_fds(
-            source_dir.as_fd(),
+            source_dir,
             source_name,
             None,
             source_opts,
-            dest_dir.as_fd(),
+            dest_dir,
             dest_name,
             None,
+            dest_opts,
+        )
+    })
+}
+
+/// Descriptor-relative verification (Linux).
+///
+/// Like [`DbKeyStore::verify`], but the source and destination are named
+/// relative to caller-owned directory descriptors and opened through
+/// `/proc/self/fd/<dirfd>/<name>`, exactly as [`rekey_at`] does. See that
+/// function for the descriptor conventions and [`DbKeyStore::verify`] for
+/// the verification contract (returned count, typed errors, sidecar
+/// hygiene). Both names must exist as regular files (`O_NOFOLLOW`; symlinks
+/// rejected). After the comparison, both directory entries are re-checked
+/// against the inodes validated at the start; a swapped entry returns
+/// [`RekeyError::SourceReplaced`] or [`RekeyError::DestinationReplaced`]
+/// instead of success.
+#[cfg(target_os = "linux")]
+pub fn verify_at(
+    source_dir: impl AsFd,
+    source_name: &str,
+    source_opts: Option<&EncryptionOpts>,
+    dest_dir: impl AsFd,
+    dest_name: &str,
+    dest_opts: Option<&EncryptionOpts>,
+) -> Result<u64, RekeyError> {
+    let source_dir = source_dir.as_fd();
+    let dest_dir = dest_dir.as_fd();
+    catch_panics(|| {
+        verify_fds(
+            source_dir,
+            source_name,
+            source_opts,
+            dest_dir,
+            dest_name,
             dest_opts,
         )
     })
@@ -407,9 +575,28 @@ fn catch_panics<T>(f: impl FnOnce() -> Result<T, RekeyError>) -> Result<T, Rekey
                 .map(ToString::to_string)
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
-            Err(RekeyError::Panicked(msg))
+            Err(RekeyError::Panicked(sanitize_panic_payload(&msg)))
         }
     }
+}
+
+/// Upper bound on the panic payload text preserved in [`RekeyError::Panicked`].
+const PANIC_PAYLOAD_MAX_CHARS: usize = 256;
+
+/// The payload originates in whatever code panicked, so it is untrusted: a
+/// hypothetical database-layer panic message could embed buffer contents.
+/// Bound its length and replace control characters before it enters the
+/// error value.
+fn sanitize_panic_payload(msg: &str) -> String {
+    let mut out: String = msg
+        .chars()
+        .take(PANIC_PAYLOAD_MAX_CHARS)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if msg.chars().nth(PANIC_PAYLOAD_MAX_CHARS).is_some() {
+        out.push_str("… (truncated)");
+    }
+    out
 }
 
 /// Path-based entry point: resolve parents, pin them with directory
@@ -452,6 +639,7 @@ fn rekey_paths(
         Some(dest_parent),
         dest_opts,
     )
+    .map(|(outcome, _dest_fd)| outcome)
 }
 
 /// Portable fallback for non-unix targets: no descriptor pinning or unix
@@ -494,11 +682,14 @@ fn rekey_paths(
                 RekeyError::Io(e)
             }
         })?;
-    let wal_path = format!("{dest_str}-wal");
-    let tshm_path = format!("{dest_str}-tshm");
+    let sidecar_paths: Vec<String> = SIDECAR_SUFFIXES
+        .iter()
+        .map(|suffix| format!("{dest_str}{suffix}"))
+        .collect();
+    let wal_path = format!("{dest_str}{WAL_SUFFIX}");
     // pre-existing sidecars are rejected (and never deleted): the database
     // layer would otherwise adopt a stale WAL for the fresh destination
-    for sidecar in [&wal_path, &tshm_path] {
+    for sidecar in &sidecar_paths {
         if Path::new(sidecar).exists() {
             let _ = std::fs::remove_file(dest_path);
             return Err(RekeyError::DestinationExists(sidecar.clone()));
@@ -518,7 +709,7 @@ fn rekey_paths(
         }
         dest_file.sync_all()?;
         // remove the (empty) sidecar files so the candidate is cleanly closed
-        for sidecar in [&wal_path, &tshm_path] {
+        for sidecar in &sidecar_paths {
             match std::fs::remove_file(sidecar) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -530,9 +721,88 @@ fn rekey_paths(
     if result.is_err() {
         // best-effort cleanup of the partial destination
         let _ = std::fs::remove_file(dest_path);
-        let _ = std::fs::remove_file(&wal_path);
-        let _ = std::fs::remove_file(&tshm_path);
+        for sidecar in &sidecar_paths {
+            let _ = std::fs::remove_file(sidecar);
+        }
     }
+    result
+}
+
+/// Existence snapshot of a database's sidecar files, taken before the
+/// database is opened, so that sidecars created as a side effect of the open
+/// (turso creates an empty WAL if none exists) can be removed afterwards,
+/// and only those: a pre-existing sidecar, or one that is no longer empty,
+/// is never touched.
+struct SidecarSnapshot {
+    /// (sidecar path, existed before our open)
+    entries: Vec<(std::path::PathBuf, bool)>,
+}
+
+impl SidecarSnapshot {
+    fn take(db_path: &Path) -> Self {
+        let entries = SIDECAR_SUFFIXES
+            .iter()
+            .map(|suffix| {
+                let mut name = db_path.file_name().unwrap_or_default().to_os_string();
+                name.push(suffix);
+                let path = db_path.with_file_name(name);
+                let existed = path.symlink_metadata().is_ok();
+                (path, existed)
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// Best-effort removal of sidecars our open created that are still empty
+    /// regular files.
+    fn remove_created_empty(&self) {
+        for (path, existed) in &self.entries {
+            if *existed {
+                continue;
+            }
+            if let Ok(meta) = path.symlink_metadata()
+                && meta.is_file()
+                && meta.len() == 0
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Path-based verification shared by all platforms: both databases must
+/// already exist; nothing is created, initialized, or written.
+fn verify_paths(
+    source_path: &Path,
+    source_opts: Option<&EncryptionOpts>,
+    dest_path: &Path,
+    dest_opts: Option<&EncryptionOpts>,
+) -> Result<u64, RekeyError> {
+    if !source_path.is_file() {
+        return Err(RekeyError::SourceNotFound(format!(
+            "{}",
+            source_path.display()
+        )));
+    }
+    if !dest_path.is_file() {
+        return Err(RekeyError::DestinationNotFound(format!(
+            "{}",
+            dest_path.display()
+        )));
+    }
+    let source_str = source_path
+        .to_str()
+        .ok_or_else(|| RekeyError::SourceNotFound("path must be valid UTF-8".to_string()))?;
+    let dest_str = dest_path
+        .to_str()
+        .ok_or_else(|| RekeyError::DestinationNotFound("path must be valid UTF-8".to_string()))?;
+    let source_sidecars = SidecarSnapshot::take(source_path);
+    let dest_sidecars = SidecarSnapshot::take(dest_path);
+    let result = run_verify(source_str, source_opts, dest_str, dest_opts);
+    // hygiene runs on failure too: a failed verify must not leave behind
+    // sidecars its own open created
+    source_sidecars.remove_created_empty();
+    dest_sidecars.remove_created_empty();
     result
 }
 
@@ -611,14 +881,15 @@ fn pinned_turso_path(
 
 /// Owns the safely-created destination file and its pre-created sidecar
 /// files, and removes them on failure (when dropped uncommitted). Every
-/// unlink — main file and sidecars alike — first checks that the directory
+/// unlink (main file and sidecars alike) first checks that the directory
 /// entry still refers to the inode this guard created, so a file substituted
 /// by someone else is never deleted.
 #[cfg(unix)]
 struct DestGuard<'a> {
     dir: BorrowedFd<'a>,
     name: &'a str,
-    file: OwnedFd,
+    /// `Some` until [`DestGuard::commit`] transfers ownership to the caller.
+    file: Option<OwnedFd>,
     /// Sidecar files we created (name, created fd), e.g. `dst.db-wal`.
     sidecars: Vec<(String, OwnedFd)>,
     committed: bool,
@@ -626,6 +897,22 @@ struct DestGuard<'a> {
 
 #[cfg(unix)]
 impl DestGuard<'_> {
+    /// The descriptor of the created destination file.
+    fn fd(&self) -> &OwnedFd {
+        self.file
+            .as_ref()
+            .expect("destination fd present until commit")
+    }
+
+    /// Mark the destination as successfully written (disabling cleanup) and
+    /// release its descriptor to the caller.
+    fn commit(mut self) -> OwnedFd {
+        self.committed = true;
+        self.file
+            .take()
+            .expect("destination fd present until commit")
+    }
+
     /// Best-effort unlink of the created sidecar files, each only if its
     /// directory entry is still the inode we created.
     fn unlink_created_sidecars(&mut self) {
@@ -659,7 +946,9 @@ impl Drop for DestGuard<'_> {
             return;
         }
         self.unlink_created_sidecars();
-        if entry_matches(self.dir, self.name, &self.file) {
+        if let Some(file) = &self.file
+            && entry_matches(self.dir, self.name, file)
+        {
             let _ = rustix::fs::unlinkat(self.dir, self.name, AtFlags::empty());
         }
     }
@@ -682,13 +971,13 @@ fn create_destination<'a>(dir: BorrowedFd<'a>, name: &'a str) -> Result<DestGuar
     let mut guard = DestGuard {
         dir,
         name,
-        file,
+        file: Some(file),
         sidecars: Vec::new(),
         committed: false,
     };
     // Pin the mode to exactly 0600 regardless of the process umask.
-    rustix::fs::fchmod(&guard.file, mode).map_err(|e| RekeyError::Io(e.into()))?;
-    let st = rustix::fs::fstat(&guard.file).map_err(|e| RekeyError::Io(e.into()))?;
+    rustix::fs::fchmod(guard.fd(), mode).map_err(|e| RekeyError::Io(e.into()))?;
+    let st = rustix::fs::fstat(guard.fd()).map_err(|e| RekeyError::Io(e.into()))?;
     if !FileType::from_raw_mode(st.st_mode).is_file() {
         return Err(RekeyError::UnsafeDestination(format!(
             "created destination '{name}' is not a regular file"
@@ -698,7 +987,7 @@ fn create_destination<'a>(dir: BorrowedFd<'a>, name: &'a str) -> Result<DestGuar
     // credential plaintext in the WAL is never world-readable. Turso opens
     // existing files without changing their mode. A pre-existing sidecar is
     // rejected (and, having not been created by us, is never deleted).
-    for suffix in ["-wal", "-tshm"] {
+    for suffix in SIDECAR_SUFFIXES {
         let sidecar = format!("{name}{suffix}");
         let sidecar_fd =
             rustix::fs::openat(dir, sidecar.as_str(), flags, mode).map_err(|e| match e {
@@ -710,11 +999,25 @@ fn create_destination<'a>(dir: BorrowedFd<'a>, name: &'a str) -> Result<DestGuar
     Ok(guard)
 }
 
-/// Open and validate the source: directory-relative, `O_NOFOLLOW`, must be a
-/// regular file. Returns the (kept-open) fd pinning the verified inode.
+/// Open and validate an existing database file: directory-relative,
+/// `O_NOFOLLOW`, must be a regular file. Returns the (kept-open) fd pinning
+/// the verified inode. Not-found and symlink cases are attributed to `side`
+/// ([`RekeyError::SourceNotFound`] / [`RekeyError::DestinationNotFound`]).
 #[cfg(unix)]
-fn open_source_checked(dir: BorrowedFd<'_>, name: &str) -> Result<OwnedFd, RekeyError> {
-    validate_name(name, "source")?;
+fn open_existing_checked(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    side: Side,
+) -> Result<OwnedFd, RekeyError> {
+    let what = match side {
+        Side::Source => "source",
+        Side::Destination => "destination",
+    };
+    let not_found = |msg: String| match side {
+        Side::Source => RekeyError::SourceNotFound(msg),
+        Side::Destination => RekeyError::DestinationNotFound(msg),
+    };
+    validate_name(name, what)?;
     let fd = rustix::fs::openat(
         dir,
         name,
@@ -722,17 +1025,15 @@ fn open_source_checked(dir: BorrowedFd<'_>, name: &str) -> Result<OwnedFd, Rekey
         Mode::empty(),
     )
     .map_err(|e| match e {
-        rustix::io::Errno::NOENT => RekeyError::SourceNotFound(name.to_string()),
-        rustix::io::Errno::LOOP => RekeyError::SourceNotFound(format!(
-            "source '{name}' is a symlink (descriptor-relative rekey requires a regular file)"
+        rustix::io::Errno::NOENT => not_found(name.to_string()),
+        rustix::io::Errno::LOOP => not_found(format!(
+            "{what} '{name}' is a symlink (descriptor-relative access requires a regular file)"
         )),
         other => RekeyError::Io(std::io::Error::from(other)),
     })?;
     let st = rustix::fs::fstat(&fd).map_err(|e| RekeyError::Io(e.into()))?;
     if !FileType::from_raw_mode(st.st_mode).is_file() {
-        return Err(RekeyError::SourceNotFound(format!(
-            "source '{name}' is not a regular file"
-        )));
+        return Err(not_found(format!("{what} '{name}' is not a regular file")));
     }
     Ok(fd)
 }
@@ -749,10 +1050,10 @@ fn rekey_fds(
     dest_name: &str,
     dest_dir_path: Option<&Path>,
     dest_opts: Option<&EncryptionOpts>,
-) -> Result<RekeyOutcome, RekeyError> {
+) -> Result<(RekeyOutcome, OwnedFd), RekeyError> {
     // Pin and validate the source inode; the descriptor is kept so the
     // directory entry can be re-verified against it after the copy.
-    let source_fd = open_source_checked(source_dir, source_name)?;
+    let source_fd = open_existing_checked(source_dir, source_name, Side::Source)?;
     let source_turso_path = pinned_turso_path(source_dir, source_name, source_dir_path)?;
 
     // Create the destination safely; the guard removes it on any failure.
@@ -771,7 +1072,7 @@ fn rekey_fds(
     // be the inode created above; otherwise the destination was substituted
     // while we were writing and turso may have written through a swapped-in
     // entry.
-    if !entry_matches(dest_dir, dest_name, &dest.file)
+    if !entry_matches(dest_dir, dest_name, dest.fd())
         || !rustix::fs::statat(dest_dir, dest_name, AtFlags::SYMLINK_NOFOLLOW)
             .is_ok_and(|st| FileType::from_raw_mode(st.st_mode).is_file())
     {
@@ -781,7 +1082,7 @@ fn rekey_fds(
     }
     for (sidecar, fd) in &dest.sidecars {
         match rustix::fs::statat(dest_dir, sidecar.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-            // already removed (e.g. by the database layer on close) — nothing
+            // already removed (e.g. by the database layer on close): nothing
             // a substituted entry could have captured
             Err(rustix::io::Errno::NOENT) => {}
             Ok(entry) => {
@@ -799,7 +1100,7 @@ fn rekey_fds(
     // The WAL was checkpointed with TRUNCATE inside run_rekey, so the created
     // WAL inode must be empty (committed credentials all live in the main
     // file). fstat on our own descriptor, so a swapped entry cannot spoof it.
-    let wal_name = format!("{dest_name}-wal");
+    let wal_name = format!("{dest_name}{WAL_SUFFIX}");
     if let Some((_, wal_fd)) = dest.sidecars.iter().find(|(name, _)| *name == wal_name) {
         let st = rustix::fs::fstat(wal_fd).map_err(|e| RekeyError::Io(e.into()))?;
         if st.st_size > 0 {
@@ -812,12 +1113,81 @@ fn rekey_fds(
 
     // Durability: sync file contents through the created descriptor, remove
     // the (empty) sidecar files we created, then sync the directory.
-    rustix::fs::fsync(&dest.file).map_err(|e| RekeyError::Io(e.into()))?;
+    rustix::fs::fsync(dest.fd()).map_err(|e| RekeyError::Io(e.into()))?;
     dest.unlink_created_sidecars();
     rustix::fs::fsync(dest_dir).map_err(|e| RekeyError::Io(e.into()))?;
 
-    dest.committed = true;
-    Ok(RekeyOutcome { copied })
+    let dest_fd = dest.commit();
+    Ok((RekeyOutcome { copied }, dest_fd))
+}
+
+/// Descriptor-relative implementation behind [`verify_at`]: pin and validate
+/// both inodes, run the streaming comparison through `/proc/self/fd` paths,
+/// clean up sidecars the open created, and re-check both directory entries.
+#[cfg(target_os = "linux")]
+fn verify_fds(
+    source_dir: BorrowedFd<'_>,
+    source_name: &str,
+    source_opts: Option<&EncryptionOpts>,
+    dest_dir: BorrowedFd<'_>,
+    dest_name: &str,
+    dest_opts: Option<&EncryptionOpts>,
+) -> Result<u64, RekeyError> {
+    let source_fd = open_existing_checked(source_dir, source_name, Side::Source)?;
+    let dest_fd = open_existing_checked(dest_dir, dest_name, Side::Destination)?;
+    let source_turso_path = pinned_turso_path(source_dir, source_name, None)?;
+    let dest_turso_path = pinned_turso_path(dest_dir, dest_name, None)?;
+
+    let source_sidecars = snapshot_sidecars_at(source_dir, source_name);
+    let dest_sidecars = snapshot_sidecars_at(dest_dir, dest_name);
+    let result = run_verify(&source_turso_path, source_opts, &dest_turso_path, dest_opts);
+    // hygiene runs on failure too: a failed verify must not leave behind
+    // sidecars its own open created
+    remove_created_empty_sidecars_at(source_dir, &source_sidecars);
+    remove_created_empty_sidecars_at(dest_dir, &dest_sidecars);
+    let verified = result?;
+
+    // Both entries must still be the inodes validated above; otherwise what
+    // was compared is not what the caller named.
+    if !entry_matches(source_dir, source_name, &source_fd) {
+        return Err(RekeyError::SourceReplaced(source_name.to_string()));
+    }
+    if !entry_matches(dest_dir, dest_name, &dest_fd) {
+        return Err(RekeyError::DestinationReplaced(dest_name.to_string()));
+    }
+    Ok(verified)
+}
+
+/// Directory-relative analog of [`SidecarSnapshot::take`].
+#[cfg(target_os = "linux")]
+fn snapshot_sidecars_at(dir: BorrowedFd<'_>, name: &str) -> Vec<(String, bool)> {
+    SIDECAR_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            let sidecar = format!("{name}{suffix}");
+            let existed =
+                rustix::fs::statat(dir, sidecar.as_str(), AtFlags::SYMLINK_NOFOLLOW).is_ok();
+            (sidecar, existed)
+        })
+        .collect()
+}
+
+/// Directory-relative analog of [`SidecarSnapshot::remove_created_empty`]:
+/// best-effort unlink of sidecars our open created that are still empty
+/// regular files.
+#[cfg(target_os = "linux")]
+fn remove_created_empty_sidecars_at(dir: BorrowedFd<'_>, snapshot: &[(String, bool)]) {
+    for (name, existed) in snapshot {
+        if *existed {
+            continue;
+        }
+        if let Ok(st) = rustix::fs::statat(dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            && FileType::from_raw_mode(st.st_mode).is_file()
+            && st.st_size == 0
+        {
+            let _ = rustix::fs::unlinkat(dir, name.as_str(), AtFlags::empty());
+        }
+    }
 }
 
 /// Open a turso database, retrying transient locking errors, mapping failures
@@ -888,7 +1258,7 @@ fn run_rekey(
     let source_conn = connect(&source_db, Side::Source)?;
     // Note: the source connection gets no journal-mode pragma so an existing
     // source is never modified; only reads are performed against it.
-    ensure_source_schema(&source_conn)?;
+    ensure_schema(&source_conn, Side::Source)?;
     let allow_ambiguity = !block_on(crate::schema_has_unique_service_user(&source_conn))
         .map_err(|e| db_err(&e, Side::Source))?;
 
@@ -909,10 +1279,19 @@ fn run_rekey(
     Ok(copied)
 }
 
-/// The source must already be a db-keystore database with a supported schema
-/// version; nothing is created or written in it (unlike opening it as a
-/// store, which would initialize missing schema).
-fn ensure_source_schema(conn: &Connection) -> Result<(), RekeyError> {
+/// The database must already be a db-keystore database with a supported
+/// schema version; nothing is created or written in it (unlike opening it as
+/// a store, which would initialize missing schema). Errors are attributed to
+/// `side` ([`RekeyError::CorruptSource`] / [`RekeyError::CorruptDestination`]).
+fn ensure_schema(conn: &Connection, side: Side) -> Result<(), RekeyError> {
+    let what = match side {
+        Side::Source => "source",
+        Side::Destination => "destination",
+    };
+    let corrupt = |msg: String| match side {
+        Side::Source => RekeyError::CorruptSource(msg),
+        Side::Destination => RekeyError::CorruptDestination(msg),
+    };
     block_on(async {
         let mut tables = std::collections::HashSet::new();
         let mut rows = conn
@@ -922,19 +1301,17 @@ fn ensure_source_schema(conn: &Connection) -> Result<(), RekeyError> {
                 (),
             )
             .await
-            .map_err(|e| db_err(&e, Side::Source))?;
-        while let Some(row) = rows.next().await.map_err(|e| db_err(&e, Side::Source))? {
-            let value = row.get_value(0).map_err(|e| db_err(&e, Side::Source))?;
+            .map_err(|e| db_err(&e, side))?;
+        while let Some(row) = rows.next().await.map_err(|e| db_err(&e, side))? {
+            let value = row.get_value(0).map_err(|e| db_err(&e, side))?;
             tables.insert(value_text(&value, "table name")?.to_string());
         }
         if !tables.contains("credentials") {
-            return Err(RekeyError::CorruptSource(
-                "no credentials table in source database".to_string(),
-            ));
+            return Err(corrupt(format!("no credentials table in {what} database")));
         }
-        // Reject unsupported schema versions rather than silently restamping
-        // the destination with the current version. A missing keystore_meta
-        // table is tolerated (nothing is ever written to the source).
+        // Reject unsupported schema versions so an incompatible database
+        // cannot be silently accepted. A missing keystore_meta table is
+        // tolerated (nothing is ever written).
         if tables.contains("keystore_meta") {
             let mut rows = conn
                 .query(
@@ -942,17 +1319,15 @@ fn ensure_source_schema(conn: &Connection) -> Result<(), RekeyError> {
                     (),
                 )
                 .await
-                .map_err(|e| db_err(&e, Side::Source))?;
-            if let Some(row) = rows.next().await.map_err(|e| db_err(&e, Side::Source))? {
-                let value = row.get_value(0).map_err(|e| db_err(&e, Side::Source))?;
+                .map_err(|e| db_err(&e, side))?;
+            if let Some(row) = rows.next().await.map_err(|e| db_err(&e, side))? {
+                let value = row.get_value(0).map_err(|e| db_err(&e, side))?;
                 let version = value_text(&value, "schema_version")?
                     .parse::<u32>()
-                    .map_err(|_| {
-                        RekeyError::CorruptSource("invalid schema_version in source".to_string())
-                    })?;
+                    .map_err(|_| corrupt(format!("invalid schema_version in {what}")))?;
                 if version != crate::SCHEMA_VERSION {
-                    return Err(RekeyError::CorruptSource(format!(
-                        "unsupported source schema version: {version}"
+                    return Err(corrupt(format!(
+                        "unsupported {what} schema version: {version}"
                     )));
                 }
             }
@@ -961,10 +1336,29 @@ fn ensure_source_schema(conn: &Connection) -> Result<(), RekeyError> {
     })
 }
 
+/// The complete database-level verification behind [`DbKeyStore::verify`]
+/// and [`verify_at`]: open both databases, validate both schemas, and stream
+/// the exact record comparison. Read-only on both sides: no pragma
+/// configuration, no schema initialization, no writes.
+fn run_verify(
+    source_path: &str,
+    source_opts: Option<&EncryptionOpts>,
+    dest_path: &str,
+    dest_opts: Option<&EncryptionOpts>,
+) -> Result<u64, RekeyError> {
+    let source_db = open_turso_db(source_path, source_opts, Side::Source)?;
+    let source_conn = connect(&source_db, Side::Source)?;
+    ensure_schema(&source_conn, Side::Source)?;
+    let dest_db = open_turso_db(dest_path, dest_opts, Side::Destination)?;
+    let dest_conn = connect(&dest_db, Side::Destination)?;
+    ensure_schema(&dest_conn, Side::Destination)?;
+    verify_records(&source_conn, &dest_conn)
+}
+
 /// Stream every credential from source to destination, one record at a time,
 /// inside a single destination transaction.
 ///
-/// Every column is copied as the raw value read from the source — no
+/// Every column is copied as the raw value read from the source with no
 /// normalization, so the destination is a byte- and storage-class-exact copy
 /// and the streaming verification (which orders and compares both sides
 /// identically) cannot be tripped by a lossy rewrite. Values are validated
@@ -1082,7 +1476,7 @@ fn value_text<'v>(value: &'v Value, field: &str) -> Result<&'v str, RekeyError> 
     }
 }
 
-/// Type name only — never value content, which may be sensitive.
+/// Returns the type name only, because value content may be sensitive.
 fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "NULL",
@@ -1099,7 +1493,7 @@ fn read_text(row: &turso::Row, idx: usize, field: &str, side: Side) -> Result<St
 }
 
 /// Deterministic total order over all record fields (including comment and
-/// secret bytes) so that equal multisets — and only equal multisets — compare
+/// secret bytes) so that equal multisets, and only equal multisets, compare
 /// equal record-by-record. Ordering by the secret as well is what lets two
 /// records with identical metadata but different secrets be detected.
 const VERIFY_SQL: &str = "SELECT service, user, uuid, comment, secret FROM credentials \
@@ -1108,7 +1502,7 @@ const VERIFY_SQL: &str = "SELECT service, user, uuid, comment, secret FROM crede
 /// Compare every source record against every destination record, streaming
 /// one record from each side at a time (bounded memory). Returns the number
 /// of records verified. Mismatch messages identify records by service, user,
-/// and uuid only — never by secret content, and no digest of secrets is
+/// and uuid; they never include secret content, and no digest of secrets is
 /// computed or exposed.
 fn verify_records(source: &Connection, dest: &Connection) -> Result<u64, RekeyError> {
     block_on(async {
@@ -1303,6 +1697,37 @@ mod tests {
         assert!(EncryptionOpts::new("", HEXKEY_256).is_err());
     }
 
+    // Acceptance (feedback B4): the Panicked payload is length-bounded and
+    // control-stripped at capture time, whatever the panicking code put in it.
+    #[test]
+    fn panicked_payload_is_bounded_and_redacted() {
+        let payload = format!("boom\x1b[31m\n\0{}", "A".repeat(4096));
+        let err = catch_panics::<()>(|| std::panic::panic_any(payload)).expect_err("must catch");
+        let RekeyError::Panicked(msg) = err else {
+            panic!("expected Panicked, got other variant");
+        };
+        assert!(
+            msg.chars().count() <= PANIC_PAYLOAD_MAX_CHARS + "… (truncated)".chars().count(),
+            "payload not bounded: {} chars",
+            msg.chars().count()
+        );
+        assert!(
+            msg.ends_with("… (truncated)"),
+            "oversized payload must be marked truncated"
+        );
+        assert!(
+            !msg.contains('\x1b') && !msg.contains('\n') && !msg.contains('\0'),
+            "control characters must be stripped"
+        );
+
+        // short, clean payloads pass through unmodified
+        let err = catch_panics::<()>(|| panic!("plain message")).expect_err("must catch");
+        let RekeyError::Panicked(msg) = err else {
+            panic!("expected Panicked, got other variant");
+        };
+        assert_eq!(msg, "plain message");
+    }
+
     fn store_at(path: &std::path::Path) -> std::sync::Arc<DbKeyStore> {
         DbKeyStore::new(DbKeyStoreConfig {
             path: path.to_path_buf(),
@@ -1327,8 +1752,8 @@ mod tests {
         (sdb, sconn, ddb, dconn)
     }
 
-    // Acceptance 1: corrupting one credential secret in the destination —
-    // leaving the row count unchanged — makes verification fail.
+    // Acceptance 1: corrupting one credential secret in the destination
+    // (leaving the row count unchanged) makes verification fail.
     #[test]
     fn verification_detects_corrupted_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1469,7 +1894,7 @@ mod tests {
 
         let entry = rustix::fs::statat(dir_fd.as_fd(), "dst.db", AtFlags::SYMLINK_NOFOLLOW)
             .expect("statat");
-        let created = rustix::fs::fstat(&guard.file).expect("fstat");
+        let created = rustix::fs::fstat(guard.fd()).expect("fstat");
         assert!(
             entry.st_ino != created.st_ino,
             "test setup: entry should now be a different inode"
