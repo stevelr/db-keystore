@@ -6,24 +6,25 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## 0.5.0-pre.1
 
-New rekey API - moved from cli to library for reusability by external crates,
-and added verification and additional integrity controls.
-Database must be quiescent for rekey operation.
-See README.md for hardening best practice.
+Pre-release for integration testing.
 
 **Highlights**
 
+- New rekey API - moved from cli to library for reusability by external crates,
+  and added verification and additional integrity controls.
+  Database must be quiescent for rekey operation.
 - After rekey, every entry in destination is verified. In 0.4.x only the number
   of entries was verified.
 - Fix: Source with invalid `schema_version` is rejected after read-only check.
   In 0.4.x rekey cli, file was not opened read-only and could have initialized schema in it.
+- See [README.md](./README.md) for hardening recommendations.
 
-**BREAKING**: `EncryptionOpts` fields are now private; the key is decoded from
-hex at construction into a `SensitiveKey` (wiped on drop) instead of being
-stored as an ordinary `String`. `EncryptionOpts::new(&str, &str)` borrows
-its arguments, validates the hex and its length against the cipher, and
-returns `Result`. Hex re-encoding for the database layer happens in a
-zeroizing buffer.
+- **Breaking** `EncryptionOpts` fields are now private; the key is decoded from
+  hex at construction into a `SensitiveKey` (wiped on drop) instead of being
+  stored as an ordinary `String`. `EncryptionOpts::new(&str, &str)` borrows
+  its arguments, validates the hex and its length against the cipher, and
+  returns `Result`. Hex re-encoding for the database layer happens in a
+  zeroizing buffer.
 
 **Added**
 
@@ -82,6 +83,7 @@ zeroizing buffer.
   (stored as `String`) or decrypted blobs (`Vec<u8`). While all buffers in
   db-keystore are zeroized, we don't have control of the turso side of
   the api boundary.
+- See README.md for hardening recommendations.
 
 ## 0.4.4
 
