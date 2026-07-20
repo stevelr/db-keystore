@@ -8,7 +8,6 @@ use zeroize::Zeroizing;
 // Stress test environment variables:
 //  - STRESS_DB_DIR: optional directory for the SQLite file (prefers tmpfs).
 //  - STRESS_DB: internal child-only database path.
-//  - STRESS_DB_TEMP_DIR: parent temp dir for child cleanup (set by parent test).
 //  - STRESS_ID: child identifier string used in generated secrets.
 //  - STRESS_CHILD: set in child processes to select child-only tests.
 //  - STRESS_MODE: selects which child test to run (e.g. "random_rw").
@@ -39,10 +38,6 @@ fn stress_two_processes() {
         .arg("--nocapture")
         .env("STRESS_CHILD", "1")
         .env("STRESS_DB", &db_path)
-        .env(
-            "STRESS_DB_TEMP_DIR",
-            tempdir.path().to_str().expect("tempdir path"),
-        )
         .env("STRESS_ID", "1")
         .spawn()
         .expect("spawn child1");
@@ -52,10 +47,6 @@ fn stress_two_processes() {
         .arg("--nocapture")
         .env("STRESS_CHILD", "1")
         .env("STRESS_DB", &db_path)
-        .env(
-            "STRESS_DB_TEMP_DIR",
-            tempdir.path().to_str().expect("tempdir path"),
-        )
         .env("STRESS_ID", "2")
         .spawn()
         .expect("spawn child2");
@@ -76,7 +67,6 @@ fn stress_child() {
     }
     let db_path = std::env::var("STRESS_DB").expect("STRESS_DB");
     let db_path = std::path::PathBuf::from(db_path);
-    let _cleanup = TempDbCleanup::from_env(&db_path);
     let id = std::env::var("STRESS_ID").unwrap_or_else(|_| "0".to_string());
     let seconds: u64 = std::env::var("STRESS_SECONDS")
         .ok()
@@ -121,10 +111,6 @@ fn stress_random_rw_two_processes() {
         .env("STRESS_CHILD", "1")
         .env("STRESS_MODE", "random_rw")
         .env("STRESS_DB", &db_path)
-        .env(
-            "STRESS_DB_TEMP_DIR",
-            tempdir.path().to_str().expect("tempdir path"),
-        )
         .env("STRESS_ID", "1")
         .env("STRESS_ENTRIES", DEFAULT_STRESS_ENTRIES.to_string())
         .env("STRESS_SECONDS", DEFAULT_STRESS_SECONDS.to_string())
@@ -137,10 +123,6 @@ fn stress_random_rw_two_processes() {
         .env("STRESS_CHILD", "1")
         .env("STRESS_MODE", "random_rw")
         .env("STRESS_DB", &db_path)
-        .env(
-            "STRESS_DB_TEMP_DIR",
-            tempdir.path().to_str().expect("tempdir path"),
-        )
         .env("STRESS_ID", "2")
         .env("STRESS_ENTRIES", DEFAULT_STRESS_ENTRIES.to_string())
         .env("STRESS_SECONDS", DEFAULT_STRESS_SECONDS.to_string())
@@ -163,7 +145,6 @@ fn stress_random_rw_child() {
     }
     let db_path = std::env::var("STRESS_DB").expect("STRESS_DB");
     let db_path = std::path::PathBuf::from(db_path);
-    let _cleanup = TempDbCleanup::from_env(&db_path);
     let id = std::env::var("STRESS_ID").unwrap_or_else(|_| "0".to_string());
     let entries: usize = std::env::var("STRESS_ENTRIES")
         .ok()
@@ -326,37 +307,6 @@ fn create_temp_db_dir() -> tempfile::TempDir {
             .expect("tempdir");
     }
     tempfile::tempdir().expect("tempdir")
-}
-
-struct TempDbCleanup {
-    db_path: std::path::PathBuf,
-}
-
-impl TempDbCleanup {
-    fn from_env(db_path: &std::path::Path) -> Option<Self> {
-        let temp_dir = std::env::var("STRESS_DB_TEMP_DIR").ok()?;
-        let temp_dir = std::path::PathBuf::from(temp_dir);
-        if db_path.starts_with(&temp_dir) {
-            Some(Self {
-                db_path: db_path.to_path_buf(),
-            })
-        } else {
-            None
-        }
-    }
-}
-
-impl Drop for TempDbCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.db_path);
-        if let Some(base) = self.db_path.file_name().and_then(|name| name.to_str()) {
-            let wal = self.db_path.with_file_name(format!("{base}-wal"));
-            let shm = self.db_path.with_file_name(format!("{base}-shm"));
-            let _ = std::fs::remove_file(wal);
-            let _ = std::fs::remove_file(shm);
-        }
-        // Note: temp_dir cleanup is handled by the parent process's TempDir
-    }
 }
 
 fn file_set_size(path: &std::path::Path) -> u64 {

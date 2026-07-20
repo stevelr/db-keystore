@@ -36,6 +36,28 @@ fn open_plain(path: &Path) -> DbKeyStore {
     (*DbKeyStore::new(config).expect("open store")).clone()
 }
 
+/// Writes credential rows through a raw turso connection so the frames stay
+/// in the WAL. The DbKeyStore API now checkpoints the WAL into the main file
+/// on every close, so tests that need an uncheckpointed source WAL must seed
+/// it below the API (turso itself does not checkpoint on close). The schema
+/// must already exist (create it by opening the store once).
+fn seed_wal_rows(path: &Path, service: &str, rows: &[(String, String)]) {
+    let db = block_on(turso::Builder::new_local(path.to_str().expect("utf8")).build()).expect("db");
+    let conn = db.connect().expect("conn");
+    for (i, (user, password)) in rows.iter().enumerate() {
+        block_on(conn.execute(
+            "INSERT INTO credentials (service, user, uuid, secret) VALUES (?1, ?2, ?3, ?4)",
+            (
+                service,
+                user.as_str(),
+                format!("018f0000-0000-7000-8000-{i:012x}"),
+                turso::Value::Blob(password.as_bytes().to_vec()),
+            ),
+        ))
+        .expect("insert row");
+    }
+}
+
 fn password_of(store: &DbKeyStore, service: &str, user: &str) -> String {
     let results = store
         .search(&HashMap::from([("service", service), ("user", user)]))
@@ -322,18 +344,17 @@ fn uncheckpointed_source_wal_is_copied() {
     let src = dir.path().join("src.db");
     let dst = dir.path().join("dst.db");
 
-    // Keep the store open so nothing forces a checkpoint, then copy the
-    // database and its live WAL to a new location: the copy has an
+    // Create the schema through the store (checkpointed into the main file),
+    // then write the credential rows below the API so they stay in the WAL,
+    // and copy the database and its WAL to a new location: the copy has an
     // uncheckpointed WAL by construction.
     let wal = src.with_file_name("src.db-wal");
     {
-        let store = open_plain(&src);
-        for i in 0..10 {
-            let entry = store
-                .build("wal-svc", &format!("user-{i}"), None)
-                .expect("build");
-            entry.set_password(&format!("pw-{i}")).expect("set");
-        }
+        let _ = open_plain(&src);
+        let rows: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("user-{i}"), format!("pw-{i}")))
+            .collect();
+        seed_wal_rows(&src, "wal-svc", &rows);
         assert!(
             wal.metadata().map(|m| m.len() > 0).unwrap_or(false),
             "test setup: source WAL should contain uncheckpointed frames"
@@ -758,10 +779,9 @@ fn verify_leaves_preexisting_source_wal_alone() {
     let dst = dir.path().join("dst.db");
     let wal = src.with_file_name("src.db-wal");
     {
-        let store = open_plain(&src);
-        let entry = store.build("svc", "user", None).expect("build");
-        entry.set_password("pw").expect("set");
+        let _ = open_plain(&src);
     }
+    seed_wal_rows(&src, "svc", &[("user".to_string(), "pw".to_string())]);
     assert!(
         wal.metadata().map(|m| m.len() > 0).unwrap_or(false),
         "test setup: source WAL should contain uncheckpointed frames"

@@ -11,6 +11,12 @@
 //!   creation and typed errors, plus standalone verification of two existing
 //!   keystores ([`DbKeyStore::verify`]): see the [`rekey`] module.
 //! - WAL + busy timeout for better multi-process behavior.
+//! - Multi-process file sharing: the file-backed store opens the database
+//!   per operation and closes it immediately afterward, so turso's
+//!   exclusive file lock is held only for the duration of each operation.
+//!   Long-lived processes (daemons) and short-lived CLI invocations can
+//!   share one keystore file; concurrent opens are handled by retry with
+//!   backoff.
 //! - Optional uniqueness enforcement on (service, user) via `allow_ambiguity=false`.
 //! - UUID and optional comment attributes exposed via the credential API.
 //! - Search supports `service`, `user`, `uuid`, and `comment` regex filters.
@@ -64,7 +70,9 @@
 //  - Concurrency: set_secret uses a transaction for read/modify/write; single statements
 //    are atomic in sqlite.
 //  - Contention: connections enable WAL and busy_timeout to reduce sqlite_BUSY in
-//    multi-process usage.
+//    multi-process usage. File-backed databases are opened per operation and
+//    closed immediately after (see `Backend`), so turso's exclusive file lock
+//    is never held between operations; concurrent opens retry with backoff.
 //  - Uniqueness: allow_ambiguity=false enforces a unique (service,user) index and
 //    uses UPSERT; allow_ambiguity=true permits multiple credentials per pair.
 //  - Zeroize used to prevent secrets (db encryption keys and keyring secrets)
@@ -268,11 +276,83 @@ pub struct DbKeyStore {
 
 #[derive(Debug)]
 struct DbKeyStoreInner {
-    db: Database,
+    backend: Backend,
     id: String,
     allow_ambiguity: bool,
     encrypted: bool,
     path: String,
+}
+
+/// How the store reaches its database.
+///
+/// turso holds an exclusive `fcntl` lock on a file-backed database for as
+/// long as the `Database` handle is open — even for reads — so only one
+/// process system-wide can have the file open at a time. To let multiple
+/// processes share one keystore file, the file backend stores the open
+/// parameters and reopens the database per operation, dropping the handle
+/// (and with it the lock) as soon as the operation completes. Overlapping
+/// opens from other processes are absorbed by the retry/backoff in
+/// [`open_db_with_retry`]. The in-memory backend keeps its database open
+/// for the store's lifetime, since its contents live only in the handle.
+#[derive(Debug)]
+enum Backend {
+    /// Persistent in-memory database, held open for the store's lifetime.
+    Memory(Database),
+    /// File-backed database, reopened per operation from these parameters
+    /// (the path lives in [`DbKeyStoreInner::path`]).
+    File {
+        encryption_opts: Option<EncryptionOpts>,
+        vfs: Option<String>,
+    },
+}
+
+/// One open database session, yielded by [`DbKeyStoreInner::connect`].
+///
+/// For the file backend this owns the reopened [`Database`]; dropping the
+/// session closes the file and releases turso's exclusive lock. Derefs to
+/// [`Connection`] so call sites use it wherever a connection is expected.
+struct DbSession {
+    /// Keeps a file-backed database open for the life of the session;
+    /// `None` for the persistent in-memory backend.
+    db: Option<Database>,
+    conn: Connection,
+}
+
+impl std::ops::Deref for DbSession {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl Drop for DbSession {
+    fn drop(&mut self) {
+        if self.db.is_some() {
+            checkpoint_before_close(&self.conn);
+        }
+    }
+}
+
+/// Folds the WAL into the main database file before a file-backed handle
+/// closes.
+///
+/// turso does not coordinate WAL state across processes (its multi-process
+/// WAL support is experimental and off here), so a WAL left behind at close
+/// is not reliably replayed when the next opener is a different process —
+/// writes can appear to vanish ("no such table: credentials"). Truncating
+/// the WAL while we still hold the exclusive file lock guarantees the next
+/// opener starts from a complete main file and an empty WAL. Best-effort:
+/// an error leaves a non-empty WAL for same-process reopen recovery, which
+/// is the pre-existing behavior.
+fn checkpoint_before_close(conn: &Connection) {
+    let result = block_on(async {
+        let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+        while (rows.next().await?).is_some() {}
+        Ok::<(), turso::Error>(())
+    });
+    if let Err(err) = result {
+        log::debug!("wal_checkpoint(TRUNCATE) on close failed: {err}");
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -310,7 +390,7 @@ impl DbKeyStore {
             .as_secs_f64();
         // move the (zeroizing) key out of the config so it has a single owner
         let encryption_opts = config.encryption_opts;
-        let (store, conn) = if let Some(vfs) = &config.vfs
+        if let Some(vfs) = &config.vfs
             && vfs == "memory"
         {
             // in-memory database. ignore path and encryption options
@@ -322,51 +402,53 @@ impl DbKeyStore {
             }))?;
             let id = format!("DbKeyStore v{CRATE_VERSION} in-memory @ {start_time}");
             let conn = map_turso(db.connect())?;
-            (
-                DbKeyStore {
-                    inner: Arc::new(DbKeyStoreInner {
-                        db,
-                        id,
-                        allow_ambiguity: config.allow_ambiguity,
-                        encrypted: false,
-                        path: ":memory:".to_string(),
-                    }),
-                },
-                conn,
-            )
+            init_schema(&conn, config.allow_ambiguity, config.index_always)?;
+            return Ok(Arc::new(DbKeyStore {
+                inner: Arc::new(DbKeyStoreInner {
+                    backend: Backend::Memory(db),
+                    id,
+                    allow_ambiguity: config.allow_ambiguity,
+                    encrypted: false,
+                    path: ":memory:".to_string(),
+                }),
+            }));
+        }
+        let path = if config.path.as_os_str().is_empty() {
+            default_path()?
         } else {
-            let path = if config.path.as_os_str().is_empty() {
-                default_path()?
-            } else {
-                config.path.clone()
-            };
-            // turso requires paths to be valid utf8
-            let path_str = path.to_str().ok_or_else(|| {
-                Error::Invalid("path".into(), "path must be valid UTF-8".to_string())
-            })?;
-            ensure_parent_dir(&path)?;
-            let encrypted = encryption_opts.is_some();
+            config.path.clone()
+        };
+        // turso requires paths to be valid utf8
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| Error::Invalid("path".into(), "path must be valid UTF-8".to_string()))?;
+        ensure_parent_dir(&path)?;
+        let encrypted = encryption_opts.is_some();
+        // Open once to validate the configuration (a wrong encryption key
+        // fails here) and initialize the schema. The handle is dropped at the
+        // end of this block so the exclusive file lock is released; each
+        // subsequent operation reopens the database via `connect`.
+        {
             let db = open_db_with_retry(path_str, encryption_opts.as_ref(), config.vfs.as_deref())?;
             let conn = retry_turso_locking(|| db.connect())?;
             configure_connection(&conn)?;
-            let id = format!(
-                "DbKeyStore v{CRATE_VERSION} path:{path_str} enc:{encrypted} @ {start_time}",
-            );
-            (
-                DbKeyStore {
-                    inner: Arc::new(DbKeyStoreInner {
-                        db,
-                        id,
-                        allow_ambiguity: config.allow_ambiguity,
-                        encrypted,
-                        path: path_str.to_string(),
-                    }),
+            init_schema(&conn, config.allow_ambiguity, config.index_always)?;
+            checkpoint_before_close(&conn);
+        }
+        let id =
+            format!("DbKeyStore v{CRATE_VERSION} path:{path_str} enc:{encrypted} @ {start_time}");
+        Ok(Arc::new(DbKeyStore {
+            inner: Arc::new(DbKeyStoreInner {
+                backend: Backend::File {
+                    encryption_opts,
+                    vfs: config.vfs.clone(),
                 },
-                conn,
-            )
-        };
-        init_schema(&conn, config.allow_ambiguity, config.index_always)?;
-        Ok(Arc::new(store))
+                id,
+                allow_ambiguity: config.allow_ambiguity,
+                encrypted,
+                path: path_str.to_string(),
+            }),
+        }))
     }
 
     pub fn new_with_modifiers(modifiers: &HashMap<&str, &str>) -> Result<Arc<DbKeyStore>> {
@@ -446,10 +528,32 @@ impl std::fmt::Debug for DbKeyStore {
 }
 
 impl DbKeyStoreInner {
-    fn connect(&self) -> Result<Connection> {
-        let conn = map_turso(self.db.connect())?;
-        configure_connection(&conn)?;
-        Ok(conn)
+    /// Opens a database session for one operation.
+    ///
+    /// The file backend reopens the database here and the returned
+    /// [`DbSession`] owns the handle, so turso's exclusive file lock is
+    /// held only until the session is dropped.
+    fn connect(&self) -> Result<DbSession> {
+        match &self.backend {
+            Backend::Memory(db) => {
+                let conn = map_turso(db.connect())?;
+                configure_connection(&conn)?;
+                Ok(DbSession { db: None, conn })
+            }
+            Backend::File {
+                encryption_opts,
+                vfs,
+            } => {
+                let db =
+                    open_db_with_retry(&self.path, encryption_opts.as_ref(), vfs.as_deref())?;
+                let conn = retry_turso_locking(|| db.connect())?;
+                configure_connection(&conn)?;
+                Ok(DbSession {
+                    db: Some(db),
+                    conn,
+                })
+            }
+        }
     }
 }
 

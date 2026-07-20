@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## 0.5.0-pre.3
+
+**Changed**
+
+- Multi-process file sharing: the file-backed store no longer holds its
+  database open (and exclusively `fcntl`-locked) for the store's lifetime.
+  The database is opened per operation and closed immediately afterward, so
+  the lock is held only for the duration of each operation. Long-lived
+  daemons and short-lived CLI invocations can now share one keystore file;
+  concurrent opens are handled by retry with backoff. In-memory
+  stores are unchanged (held open for the store's lifetime).
+- On every close of a file-backed session (including store creation), the
+  WAL is folded into the main database file via
+  `PRAGMA wal_checkpoint(TRUNCATE)` while the exclusive lock is still held.
+  After any clean close, the `.db` file alone is a complete copy of the
+  keystore (no `-wal`/`-tshm` needed), and no cross-process WAL replay is
+  relied upon (turso's multi-process WAL coordination is experimental and
+  not enabled).
+- Upgraded turso 0.7.0 -> 0.7.1; re-verified the sidecar suffix set
+  (`-wal`, `-tshm`) is unchanged (`coordination_path_for_wal_path` is
+  identical) and updated the pin in `tests/sidecar_pin.rs`.
+
 ## 0.5.0-pre.2
 
 **Added**
