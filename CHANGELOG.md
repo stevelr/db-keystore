@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## 0.5.0
+
+Highlights - since 0.4.x
+
+- **Multiprocess friendly**. Previously, the database file was locked for
+  exclusive use during the lifetime of the keystore. In most cases, where the db
+  is only needed for a brief operation, holding a long lock is unnecessary,
+  and prevents another process using db-keystore crate from sharing
+  the same file. In 0.5, the db file is opened for the duration of the operation
+  and then closed. This change enables multiple processes to share the same database
+  file. If a call to open is blocked by a locked file, `open` retries internally
+  until the file is unblocked or retry timeout. For reliable
+  operation we recommend using a local file system for the keystore db, rather
+  than a remote-mounted file, which may be subject to network delays or intermittent
+  connectivity.
+
+- **WAL consolidation**. After closing, while an exclusive lock is held, the WAL
+  is folded into the main database file, leaving the directory with the `.db`
+  file only.
+
+- **Rekey improvements**. The rekey operation was moved from the cli to the library,
+  making it available for in-process use. The rekey operation previously had
+  a limited validation check that only verified that number of entries was preserved.
+  The 0.5.0 implementation checks every key, value, and piece of metadata to confirm
+  they are identical, and only then returns success. In the even of an unsuccessful
+  rekey operation, the faulty copy is removed.
+
+- **Breaking** `EncryptionOpts` fields are now private. This was necessary
+  to enforce the policy of zeroizing wrappers for all data structures containing
+  secrets.
+
+- Other: Updated all dependencies. Turso is at 0.7.1. More unit tests.
+
 ## 0.5.0-pre.3
 
 **Changed**

@@ -1,6 +1,6 @@
 [package]
 name = "db-keystore"
-version = "0.5.0-pre.3"
+version = "0.5.0"
 authors = ["Steve Schoettler <stevelr-git@pm.me>"]
 categories = ["database", "api-bindings"]
 edition = "2024"
