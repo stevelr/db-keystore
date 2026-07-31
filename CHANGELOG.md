@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## 0.5.1
+
+- Bumped turso from 0.7.1 to 0.7.2.
+  Turso 0.7.2 changes include fsync synchronization fixes and rollback safety.
+- Removed obsolete example (demo of turso's 0.5 bug fix for handling of invalid encryption key)
+
 ## 0.5.0
 
 Highlights - since 0.4.x

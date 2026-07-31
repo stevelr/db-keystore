@@ -544,14 +544,10 @@ impl DbKeyStoreInner {
                 encryption_opts,
                 vfs,
             } => {
-                let db =
-                    open_db_with_retry(&self.path, encryption_opts.as_ref(), vfs.as_deref())?;
+                let db = open_db_with_retry(&self.path, encryption_opts.as_ref(), vfs.as_deref())?;
                 let conn = retry_turso_locking(|| db.connect())?;
                 configure_connection(&conn)?;
-                Ok(DbSession {
-                    db: Some(db),
-                    conn,
-                })
+                Ok(DbSession { db: Some(db), conn })
             }
         }
     }

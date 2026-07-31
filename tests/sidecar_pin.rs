@@ -3,7 +3,7 @@
 //! db-keystore pre-creates a database's sidecar files with mode `0600` so
 //! credential plaintext in the WAL is never world-readable, and its cleanup
 //! and verification logic iterates the same set (`SIDECAR_SUFFIXES` in
-//! `src/rekey.rs`). That set is correct for turso 0.7.1 by manual
+//! `src/rekey.rs`). That set is correct for turso 0.7.2 by manual
 //! verification (`coordination_path_for_wal_path`). If a turso upgrade
 //! renames or adds a sidecar, the pre-creation guarantee would silently no
 //! longer cover the new file. These tests therefore fail on any turso bump
@@ -17,7 +17,7 @@ use keyring_core::api::CredentialStoreApi;
 /// Update only after re-verifying the sidecar file set against the new turso
 /// (see module docs), and keep `PINNED_SIDECAR_SUFFIXES` and
 /// `SIDECAR_SUFFIXES` in `src/rekey.rs` in sync with what you find.
-const PINNED_TURSO_VERSION: &str = "0.7.1";
+const PINNED_TURSO_VERSION: &str = "0.7.2";
 
 /// Must match `SIDECAR_SUFFIXES` in `src/rekey.rs`.
 const PINNED_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-tshm"];
