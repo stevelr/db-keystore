@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## 0.5.2-pre.1
+
+- building with --no-default-features disables turso's "mimalloc". This is to enable building on a wider range of platforms.
+
 ## 0.5.1
 
 - Bumped turso from 0.7.1 to 0.7.2.
