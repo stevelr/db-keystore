@@ -4,9 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## 0.5.2-pre.1
+## 0.5.2
 
-- building with --no-default-features disables turso's "mimalloc". This is to enable building on a wider range of platforms.
+- adds mimalloc feature, enabled by default. The default behavior is unchanged from 0.5.0 and 0.5.1. Building with `--no-default-features` (a) removes Turso's `mimalloc` dependency, allowing and consumers to choose their own process global allocator, and (b) removes a native C dependency, simplifying compilation/toolchain requirements.
+- pins turso to 0.7.2; adds turso_core as a constraint dependency pinned to 0.7.2.
+- bump uuid 1.24 to 1.26
 
 ## 0.5.1
 

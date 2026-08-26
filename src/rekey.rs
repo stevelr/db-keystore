@@ -263,7 +263,7 @@ impl SensitiveKey {
             ));
         }
         let mut bytes = Zeroizing::new([0u8; 32]);
-        for (i, pair) in hexkey.as_bytes().chunks_exact(2).enumerate() {
+        for (i, pair) in hexkey.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let hi = hex_nibble(pair[0])?;
             let lo = hex_nibble(pair[1])?;
             bytes[i] = (hi << 4) | lo;
