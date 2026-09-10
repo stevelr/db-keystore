@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## Unreleased
+
+### Changes
+
+Pre-release: 0.6.0-pre.1
+
+- db-keystore does not set the process global allocator. In db-keystore through 0.5.x, the embedded turso library forced the allocator to jemalloc. In 0.6.0+, the app chooses (as it should be; libraries should not impose a default process-wide allocator). By default, you get the rust standard allocator, or an app can select one with `#[global_allocator]`. See https://doc.rust-lang.org/std/alloc/index.html.
+
+- bumped rust toolchain to 1.98.1
+
 ## 0.5.2
 
 - adds mimalloc feature, enabled by default. The default behavior is unchanged from 0.5.0 and 0.5.1. Building with `--no-default-features` (a) removes Turso's `mimalloc` dependency, allowing and consumers to choose their own process global allocator, and (b) removes a native C dependency, simplifying compilation/toolchain requirements.

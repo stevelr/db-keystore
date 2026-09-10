@@ -396,7 +396,7 @@ impl DbKeyStore {
             // in-memory database. ignore path and encryption options
             let db = map_turso(block_on(async {
                 Builder::new_local(":memory:")
-                    .with_io("memory".into())
+                    .with_io("memory")
                     .build()
                     .await
             }))?;
