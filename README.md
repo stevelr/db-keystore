@@ -141,7 +141,7 @@ List the ambiguous entries with `db-keystore list --ambiguous` and use `db-keyst
 
 ## Maintenance tool
 
-Install with `cargo install db-keystore` (or from source `cargo install --path .`)
+The maintenance tool requires building with the `cli` feature. Install with `cargo install db-keystore --features cli` (or from source `cargo install --path . --features cli`). To build the binary from source, use `cargo build --features cli --bin db-keystore`.
 
 ```sh
 # Global args

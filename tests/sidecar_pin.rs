@@ -1,10 +1,12 @@
-//! Pins the turso version together with the sidecar suffix set (feedback B3).
+//! Pins the turso version together with the WAL sidecar suffix set.
 //!
 //! db-keystore pre-creates a database's sidecar files with mode `0600` so
 //! credential plaintext in the WAL is never world-readable, and its cleanup
 //! and verification logic iterates the same set (`SIDECAR_SUFFIXES` in
-//! `src/rekey.rs`). That set is correct for turso 0.7.2 by manual
-//! verification (`coordination_path_for_wal_path`). If a turso upgrade
+//! `src/rekey.rs`). The pinned version's `do_open_async_internal` uses
+//! `{path}-wal`; `coordination_path_for_wal_path` derives `{path}-tshm`
+//! for experimental multiprocess WAL, which this crate leaves disabled.
+//! The subjournal uses `MemoryIO` and creates no disk sidecar. If a turso upgrade
 //! renames or adds a sidecar, the pre-creation guarantee would silently no
 //! longer cover the new file. These tests therefore fail on any turso bump
 //! until the set is re-verified and the pin below is updated.
@@ -17,7 +19,7 @@ use keyring_core::api::CredentialStoreApi;
 /// Update only after re-verifying the sidecar file set against the new turso
 /// (see module docs), and keep `PINNED_SIDECAR_SUFFIXES` and
 /// `SIDECAR_SUFFIXES` in `src/rekey.rs` in sync with what you find.
-const PINNED_TURSO_VERSION: &str = "0.7.2";
+const PINNED_TURSO_VERSION: &str = "0.8.0-pre.10";
 
 /// Must match `SIDECAR_SUFFIXES` in `src/rekey.rs`.
 const PINNED_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-tshm"];

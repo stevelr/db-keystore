@@ -90,14 +90,13 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
-/// The sidecar files turso 0.7 creates next to a database file.
+/// The sidecar files turso uses next to a database file in WAL mode.
 ///
 /// This is the single source of truth for the suffix set: destination
 /// pre-creation (mode `0600`), failure cleanup, post-rekey re-verification,
-/// and verify's sidecar hygiene all iterate this list. Verified against turso
-/// 0.7.2 (`coordination_path_for_wal_path`); `tests/sidecar_pin.rs` pins the
-/// turso version together with this set so a dependency bump fails CI until
-/// the set is re-verified.
+/// and verify's sidecar hygiene all iterate this list. `tests/sidecar_pin.rs`
+/// records the verified turso version and naming functions, and pins the
+/// version so a dependency bump fails CI until the set is re-verified.
 const SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-tshm"];
 
 /// The WAL member of [`SIDECAR_SUFFIXES`], singled out for the
