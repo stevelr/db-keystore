@@ -11,7 +11,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 Pre-release: 0.6.0-pre.1
 
 - db-keystore does not set the process global allocator. In db-keystore through 0.5.x, the embedded turso library forced the allocator to jemalloc. In 0.6.0+, the app chooses (as it should be; libraries should not impose a default process-wide allocator). By default, you get the rust standard allocator, or an app can select one with `#[global_allocator]`. See https://doc.rust-lang.org/std/alloc/index.html.
-
+- bump turso to 0.8.0-pre.10 (pinned)
 - bumped rust toolchain to 1.98.1
 
 ## 0.5.2
