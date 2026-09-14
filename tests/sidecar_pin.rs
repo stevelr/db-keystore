@@ -19,7 +19,7 @@ use keyring_core::api::CredentialStoreApi;
 /// Update only after re-verifying the sidecar file set against the new turso
 /// (see module docs), and keep `PINNED_SIDECAR_SUFFIXES` and
 /// `SIDECAR_SUFFIXES` in `src/rekey.rs` in sync with what you find.
-const PINNED_TURSO_VERSION: &str = "0.8.0-pre.10";
+const PINNED_TURSO_VERSION: &str = "0.8.1";
 
 /// Must match `SIDECAR_SUFFIXES` in `src/rekey.rs`.
 const PINNED_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-tshm"];
