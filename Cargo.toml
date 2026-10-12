@@ -1,10 +1,9 @@
 [package]
 name = "db-keystore"
-version = "0.6.0"
+version = "0.6.1-pre.1"
 authors = ["Steve Schoettler <stevelr-git@pm.me>"]
 categories = ["database", "api-bindings"]
 edition = "2024"
-homepage = "https://github.com/stevelr/db-keystore"
 keywords = ["keyring", "credential", "sqlite", "turso", "secrets-manager"]
 license = "MIT or Apache-2.0"
 readme = "README.md"
@@ -25,21 +24,21 @@ cli = ["dep:anyhow", "dep:clap", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 anyhow = { version = "1.0.104", optional = true }
-clap = { version = "4.6.6", features = ["derive"], optional = true }
+clap = { version = "4.6.7", features = ["derive"], optional = true }
 futures = "0.3.34"
 keyring-core = "1.0.0"
 log = "0.4.34"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"], optional = true }
-serde_json = { version = "1.0.151", optional = true }
-turso = { version = "=0.8.1", default-features = false }
-uuid = { version = "1.26.1", features = ["v7"] }
-zeroize = "1.9.0"
+serde_json = { version = "1.0.154", optional = true }
+turso = { version = "=0.8.3", default-features = false }
+uuid = { version = "1.28.0", features = ["v7"] }
+zeroize = "1.9.1"
 
 # pinned versions of all turso
-turso_core = "=0.8.1"
-turso_sdk_kit = "=0.8.1"
-turso_sync_sdk_kit = "=0.8.1"
+turso_core = "=0.8.3"
+turso_sdk_kit = "=0.8.3"
+turso_sync_sdk_kit = "=0.8.3"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
@@ -55,3 +54,9 @@ unsafe_code = { level = "forbid", priority = -1 }
 # strict clippy rules
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
+
+# branches 0.4.x fails to build on recent nightly (removed core::intrinsics::abort).
+# turso_core requires `branches ^0.4.3`, so route it through a 0.4-versioned shim
+# that re-exports branches 0.5.1 (see patches/branches). Remove once turso bumps.
+[patch.crates-io]
+branches = { path = "patches/branches" }

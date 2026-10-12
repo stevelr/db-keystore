@@ -1,0 +1,23 @@
+# Shim that satisfies turso_core's `branches = "^0.4.3"` requirement while
+# building against branches 0.5.1. branches 0.4.x fails on recent nightlies
+# (`core::intrinsics::abort` was removed); 0.5.x tracks the renamed intrinsic.
+# Wired in via `[patch.crates-io]` in the root Cargo.toml. Drop this once
+# turso_core depends on branches 0.5.
+[package]
+name = "branches"
+version = "0.4.99"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Semver shim re-exporting branches 0.5 under a 0.4-compatible version"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["std", "prefetch"]
+std = ["branches/std"]
+prefetch = ["branches/prefetch"]
+
+[dependencies]
+branches = { version = "0.5.1", default-features = false }

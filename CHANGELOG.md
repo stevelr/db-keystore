@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## Unreleased (0.6.1-pre.1)
+
+- bumped turso to 0.8.3.
+- patched turso to use branches-0.5.1 to fix rust nightly build (1.101), which changed core::intrinsics::abort() to core::intrinsics::abort_immediate().
+
 ## 0.6.0
 
 ### Changed
